@@ -1,4 +1,4 @@
-// ApolloGalleryImageViewer.m — see ApolloGalleryImageViewer.h.
+// ApolloGalleryImageViewer.m — see ApolloGalleryImageViewer.h. 
 
 #import "ApolloGalleryImageViewer.h"
 #import "ApolloGalleryFeed.h"
