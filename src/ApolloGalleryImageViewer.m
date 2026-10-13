@@ -1,4 +1,4 @@
-// ApolloGalleryImageViewer.m — see ApolloGalleryImageViewer.h. 
+// ApolloGalleryImageViewer.m — see ApolloGalleryImageViewer.h.
 
 #import "ApolloGalleryImageViewer.h"
 #import "ApolloGalleryFeed.h"
@@ -101,6 +101,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 @property (nonatomic, strong, nullable) id playerEndObserver;
 @property (nonatomic, copy, nullable) NSURL *videoURL;
 @property (nonatomic, readonly) BOOL hasVideo;
+@property (nonatomic) BOOL slideshowWaitForVideo;
 // YES once the FULL-SIZE image is what's on screen. While it's NO, the image
 // view is showing the grid's downsampled thumbnail as a placeholder — which
 // Save/Share must never export.
@@ -280,8 +281,10 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
                                                           object:player.currentItem
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *note) {
-        [weakSelf.player seekToTime:kCMTimeZero];
-        [weakSelf.player play];
+        if (!weakSelf.slideshowWaitForVideo) {
+            [weakSelf.player seekToTime:kCMTimeZero];
+            [weakSelf.player play];
+        }
     }];
 
     AVPlayerLayer *layer = [AVPlayerLayer playerLayerWithPlayer:player];
@@ -523,6 +526,7 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 @property (nonatomic, strong) UIButton *slideshowSpeedButton;
 @property (nonatomic, strong) UIView *slideshowSpeedHost;
 @property (nonatomic, strong, nullable) NSTimer *slideshowTimer;
+@property (nonatomic, strong, nullable) id slideshowVideoEndObserver;
 @property (nonatomic) NSTimeInterval slideshowInterval;
 @property (nonatomic) BOOL slideshowPlaying;
 // Applied in -viewDidLayoutSubviews once the collection view has a real size;
@@ -764,6 +768,7 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 
 - (void)dealloc {
     [_slideshowTimer invalidate];
+    if (_slideshowVideoEndObserver) [[NSNotificationCenter defaultCenter] removeObserver:_slideshowVideoEndObserver];
     // The periodic transport observer must come off the exact player that
     // issued it before that player goes away.
     if (_observedPlayer && _videoTimeObserverToken) {
@@ -1567,6 +1572,11 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
 - (void)apollo_stopSlideshow {
     [self.slideshowTimer invalidate];
     self.slideshowTimer = nil;
+    if (self.slideshowVideoEndObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:self.slideshowVideoEndObserver];
+        self.slideshowVideoEndObserver = nil;
+    }
+    [self apollo_currentCell].slideshowWaitForVideo = NO;
     self.slideshowPlaying = NO;
     [self apollo_updateSlideshowControls];
 }
@@ -1574,7 +1584,32 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
 - (void)apollo_scheduleSlideshowTick {
     [self.slideshowTimer invalidate];
     self.slideshowTimer = nil;
+    if (self.slideshowVideoEndObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:self.slideshowVideoEndObserver];
+        self.slideshowVideoEndObserver = nil;
+    }
+    ApolloGalleryViewerCell *cell = [self apollo_currentCell];
+    cell.slideshowWaitForVideo = NO;
     if (!self.slideshowPlaying || self.feed.items.count < 2) return;
+    if ([self apollo_currentItem].playsAsVideo) {
+        cell.slideshowWaitForVideo = YES;
+        AVPlayerItem *playerItem = cell.player.currentItem;
+        if (playerItem) {
+            __weak typeof(self) weakSelf = self;
+            self.slideshowVideoEndObserver = [[NSNotificationCenter defaultCenter]
+                addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
+                            object:playerItem queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                typeof(self) strongSelf = weakSelf;
+                if (!strongSelf || !strongSelf.slideshowPlaying ||
+                    [strongSelf apollo_currentCell].player.currentItem != note.object) return;
+                [strongSelf apollo_slideshowAdvance];
+            }];
+        }
+        // Hosted video URLs can resolve asynchronously. Wait for the player,
+        // never advance on a timer while the current item is a video.
+        return;
+    }
     self.slideshowTimer = [NSTimer scheduledTimerWithTimeInterval:self.slideshowInterval
                                                           target:self selector:@selector(apollo_slideshowTick:)
                                                         userInfo:nil repeats:NO];
@@ -1595,6 +1630,11 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
         [self apollo_stopSlideshow];
         return;
     }
+    [self apollo_slideshowAdvance];
+}
+
+- (void)apollo_slideshowAdvance {
+    if (!self.slideshowPlaying || self.feed.items.count < 2) return;
     NSInteger next = (self.currentIndex + 1) % (NSInteger)self.feed.items.count;
     CGFloat width = MAX(self.collectionView.bounds.size.width, 1.0);
     [self.collectionView setContentOffset:CGPointMake(width * next, 0.0) animated:NO];
@@ -1628,6 +1668,7 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
     [self apollo_scheduleInfoPanelAutoHide];
     [self apollo_updateChromeContent];
     [self apollo_syncPlayback];
+    if (self.slideshowPlaying) [self apollo_scheduleSlideshowTick];
     [self apollo_prefetchAroundIndex:page];
     [self apollo_loadMoreIfNeeded];
 }
@@ -1647,6 +1688,7 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
             // The resolution just swapped in a fresh player; repoint the
             // transport at it (the pre-resolution bind saw nil).
             [strongSelf apollo_bindVideoBarToPlayer:currentCell.player];
+            if (strongSelf.slideshowPlaying) [strongSelf apollo_scheduleSlideshowTick];
             if (!resolvedOriginal && !currentItem.videoURL) {
                 [strongSelf apollo_showToast:@"Couldn't load video"];
             }
