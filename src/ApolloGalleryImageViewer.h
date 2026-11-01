@@ -5,6 +5,9 @@
 // toggle the chrome (post title / u/author / r/subreddit bottom-left, position
 // counter top-right, share top-right, Done top-left).
 //
+// Slideshow starts only with Play. Pause and 1/2/3/5/10-second controls
+// share the chrome; completed videos advance, and the loaded feed loops.
+//
 // It reads directly from the live ApolloGalleryFeed rather than a snapshot, so
 // paging past the last loaded picture pulls the next batch in place and the
 // counter's total grows — the same feed the grid behind it is showing, so the
@@ -25,6 +28,8 @@ NS_ASSUME_NONNULL_BEGIN
 // Closing on `index` — the grid scrolls that tile into view so the user lands
 // back where they left off.
 - (void)galleryViewer:(ApolloGalleryImageViewer *)viewer willDismissAtIndex:(NSInteger)index;
+// The dismissal has completed; the retained grid can resume playback.
+- (void)galleryViewerDidDismiss:(ApolloGalleryImageViewer *)viewer;
 @end
 
 @interface ApolloGalleryImageViewer : UIViewController

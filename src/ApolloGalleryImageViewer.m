@@ -1,10 +1,14 @@
 // ApolloGalleryImageViewer.m — see ApolloGalleryImageViewer.h.
 
 #import "ApolloGalleryImageViewer.h"
+#import "ApolloGallerySlideshowPolicy.h"
 #import "ApolloGalleryFeed.h"
 #import "ApolloGalleryImageLoader.h"
 #import "ApolloCommon.h"
+#import "ApolloDeviceGeometry.h"
 #import "ApolloGalleryVideoExport.h"
+#import "ApolloGalleryMediaActions.h"
+#import "ApolloNativeActionMenus.h"
 
 #import <Photos/Photos.h>
 #import <AVFoundation/AVFoundation.h>
@@ -25,7 +29,7 @@ static CGFloat const kApolloGalleryViewerDismissVelocity = 850.0;
 // the end, so paging rarely stalls on the network.
 static NSInteger const kApolloGalleryViewerLoadAheadSlack = 4;
 // On a video page a hold first arms hold-and-drag scrubbing; left still this
-// much longer (seconds), it opens the actions sheet instead. Pictures, which
+// much longer (seconds), it opens the actions menu instead. Pictures, which
 // can't scrub, open it the moment the hold registers.
 static NSTimeInterval const kApolloGalleryViewerHoldActionsDelay = 0.3;
 
@@ -96,12 +100,15 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 @property (nonatomic, copy, nullable) NSURL *imageURL;
 // Video side. The poster image stays underneath until the first frame is ready,
 // so paging onto a clip never flashes black.
+// The slideshow consumes the end event instead of the cell looping the clip.
+@property (nonatomic) BOOL slideshowOwnsVideoEnd;
+@property (nonatomic) BOOL videoFinished;
+@property (nonatomic) BOOL playbackActive;
 @property (nonatomic, strong, nullable) AVPlayer *player;
 @property (nonatomic, strong, nullable) AVPlayerLayer *playerLayer;
 @property (nonatomic, strong, nullable) id playerEndObserver;
 @property (nonatomic, copy, nullable) NSURL *videoURL;
 @property (nonatomic, readonly) BOOL hasVideo;
-@property (nonatomic) BOOL slideshowWaitForVideo;
 // YES once the FULL-SIZE image is what's on screen. While it's NO, the image
 // view is showing the grid's downsampled thumbnail as a placeholder — which
 // Save/Share must never export.
@@ -256,6 +263,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 // Setting up / tearing down playback ----------------------------------------
 
 - (void)teardownPlayer {
+    self.playbackActive = NO;
     if (self.playerEndObserver) {
         [[NSNotificationCenter defaultCenter] removeObserver:self.playerEndObserver];
         self.playerEndObserver = nil;
@@ -265,11 +273,13 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
     self.playerLayer = nil;
     self.player = nil;
     self.videoURL = nil;
+    self.videoFinished = NO;
 }
 
 - (void)prepareVideo:(NSURL *)url {
     if (!url) return;
     self.videoURL = url;
+    self.videoFinished = NO;
 
     AVPlayer *player = [AVPlayer playerWithURL:url];
     player.muted = ApolloGalleryViewerVideosMuted();
@@ -281,10 +291,13 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
                                                           object:player.currentItem
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *note) {
-        if (!weakSelf.slideshowWaitForVideo) {
-            [weakSelf.player seekToTime:kCMTimeZero];
-            [weakSelf.player play];
-        }
+        ApolloGalleryViewerCell *cell = weakSelf;
+        if (!cell || !cell.playbackActive || note.object != cell.player.currentItem) return;
+        cell.videoFinished = YES;
+        if (cell.slideshowOwnsVideoEnd) return;
+        cell.videoFinished = NO;
+        [weakSelf.player seekToTime:kCMTimeZero];
+        [weakSelf.player play];
     }];
 
     AVPlayerLayer *layer = [AVPlayerLayer playerLayerWithPlayer:player];
@@ -299,6 +312,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 }
 
 - (void)playIfPossible {
+    self.playbackActive = YES;
     // Players are created LAZILY, for the current page only: adjacent pages a
     // paging collection view keeps materialized show their poster frame and
     // cost no AVPlayer, no buffering, no decoder session. The player appears
@@ -306,6 +320,10 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
     // cell reuse.
     if (!self.player && self.videoURL) [self prepareVideo:self.videoURL];
     if (!self.player) return;
+    if (self.videoFinished) {
+        self.videoFinished = NO;
+        [self.player seekToTime:kCMTimeZero];
+    }
     // Playback needs the session on a category that isn't silenced by the
     // ringer switch; Apollo parks it on Ambient, which mutes everything.
     ApolloGalleryViewerActivateAudioSession();
@@ -314,6 +332,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 }
 
 - (void)pausePlayback {
+    self.playbackActive = NO;
     [self.player pause];
 }
 
@@ -520,15 +539,9 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 @property (nonatomic, strong) UICollectionView *collectionView;
 @property (nonatomic, strong) UICollectionViewFlowLayout *layout;
 @property (nonatomic) NSInteger currentIndex;
-// Opt-in slideshow for the fullscreen Gallery viewer.
-@property (nonatomic, strong) UIButton *slideshowButton;
-@property (nonatomic, strong) UIView *slideshowHost;
-@property (nonatomic, strong) UIButton *slideshowSpeedButton;
-@property (nonatomic, strong) UIView *slideshowSpeedHost;
-@property (nonatomic, strong, nullable) NSTimer *slideshowTimer;
-@property (nonatomic, strong, nullable) id slideshowVideoEndObserver;
-@property (nonatomic) NSTimeInterval slideshowInterval;
-@property (nonatomic) BOOL slideshowPlaying;
+// Hosted items whose lookup this viewer is already waiting on, so repeated
+// playback syncs register one completion per item, not one per sync.
+@property (nonatomic, strong) NSMutableSet<ApolloGalleryItem *> *hostedLookupsAwaited;
 // Applied in -viewDidLayoutSubviews once the collection view has a real size;
 // setting the offset before that lands on the wrong page.
 @property (nonatomic) BOOL hasAppliedInitialIndex;
@@ -602,9 +615,12 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 // Hold-and-drag scrubbing on the video itself (Apollo's MediaViewer has the
 // same gesture as scrubPanGestureRecognizer): the long-press arms on a video
 // page, and horizontal movement past a small slop turns it into a scrub. A
-// press that stays still opens the actions sheet instead — while the finger is
+// press that stays still opens the actions menu instead — while the finger is
 // still down, kApolloGalleryViewerHoldActionsDelay after arming, or on release
 // if it lifts sooner.
+// Keep the action target stable until UIKit finishes dismissing its menu.
+@property (nonatomic, strong) ApolloGalleryMediaActions *mediaMenuSession;
+@property (nonatomic) CGPoint mediaHoldPoint;
 @property (nonatomic) BOOL gestureScrubArmed;
 @property (nonatomic) BOOL gestureScrubActive;
 @property (nonatomic) CGFloat gestureScrubStartX;
@@ -642,6 +658,15 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 // video ever played (issue #1104: Gallery View shown on CarPlay through
 // CarBridge/CarCast).
 @property (nonatomic) CGSize lastLaidOutPageSize;
+@property (nonatomic) BOOL slideshowRunning;
+@property (nonatomic) BOOL slideshowVideoPaused;
+@property (nonatomic) NSTimeInterval slideshowInterval;
+@property (nonatomic) CFTimeInterval slideshowDeadline;
+@property (nonatomic, strong) NSTimer *slideshowTimer;
+@property (nonatomic, strong) UIButton *slideshowButton;
+@property (nonatomic, strong) UIButton *slideshowSpeedButton;
+@property (nonatomic, strong) UIView *slideshowHost;
+@property (nonatomic, strong) UIView *slideshowSpeedHost;
 @end
 
 @implementation ApolloGalleryImageViewer
@@ -650,13 +675,15 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
     self = [super initWithNibName:nil bundle:nil];
     if (self) {
         _feed = feed;
+        _slideshowInterval = 1.0;
         _pendingInitialIndex = MAX(0, MIN(initialIndex, (NSInteger)feed.items.count - 1));
         _currentIndex = _pendingInitialIndex;
         _chromeVisible = YES;
-        _slideshowInterval = 1.0;
         _prefetchRadius = kApolloGalleryViewerPrefetchRadius;
         _viewerPrefetches = [NSMutableDictionary dictionary];
-        self.modalPresentationStyle = UIModalPresentationFullScreen;
+        // Keep the grid mounted beneath the viewer. Removing it (FullScreen)
+        // left a black window behind a dragged/fading image until dismissal.
+        self.modalPresentationStyle = UIModalPresentationOverFullScreen;
         self.modalPresentationCapturesStatusBarAppearance = YES;
     }
     return self;
@@ -679,6 +706,7 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.blackColor;
+    self.view.accessibilityViewIsModal = YES;
     // The viewer is a black fullscreen surface with white text and icons, but
     // the APP is usually in light mode — so the iOS 26 glass pills first
     // resolved their LIGHT variant (white frost, unreadable white-on-white
@@ -708,7 +736,9 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
     [self.view addSubview:self.collectionView];
 
     [self apollo_buildChrome];
-    [self apollo_updateSlideshowControls];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+        selector:@selector(apollo_pauseSlideshow)
+        name:UIApplicationWillResignActiveNotification object:nil];
 
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(apollo_singleTapped:)];
     tap.numberOfTapsRequired = 1;
@@ -749,7 +779,7 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
-    [self apollo_stopSlideshow];
+    [self apollo_pauseSlideshow];
     // A forced rotation belongs to the viewer only: hand the app back to
     // portrait on the way out, or the feed underneath is left sideways while
     // the user's orientation lock says otherwise. Guarded on isBeingDismissed
@@ -768,7 +798,7 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 
 - (void)dealloc {
     [_slideshowTimer invalidate];
-    if (_slideshowVideoEndObserver) [[NSNotificationCenter defaultCenter] removeObserver:_slideshowVideoEndObserver];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     // The periodic transport observer must come off the exact player that
     // issued it before that player goes away.
     if (_observedPlayer && _videoTimeObserverToken) {
@@ -851,22 +881,22 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
     [self.doneButton addTarget:self action:@selector(apollo_donePressed) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.doneHost];
 
+    self.slideshowButton = ApolloGalleryChromeButton(ApolloGalleryChromeSymbol(@"play.fill"), nil, &_slideshowHost);
+    self.slideshowButton.accessibilityLabel = @"Play slideshow";
+    [self.slideshowButton addTarget:self action:@selector(apollo_toggleSlideshow) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.slideshowHost];
+    self.slideshowSpeedButton = ApolloGalleryChromeButton(nil, @"1 s", &_slideshowSpeedHost);
+    self.slideshowSpeedButton.accessibilityLabel = @"Slideshow interval";
+    self.slideshowSpeedButton.showsMenuAsPrimaryAction = YES;
+    [self.view addSubview:self.slideshowSpeedHost];
+    [self apollo_updateSlideshowControls];
+
     self.counterLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     self.counterLabel.textColor = UIColor.whiteColor;
     self.counterLabel.font = [UIFont monospacedDigitSystemFontOfSize:14.0 weight:UIFontWeightSemibold];
     self.counterLabel.textAlignment = NSTextAlignmentCenter;
     self.counterPill = ApolloGalleryChromePill(self.counterLabel, 0.55);
     [self.view addSubview:self.counterPill];
-
-    self.slideshowButton = ApolloGalleryChromeButton(ApolloGalleryChromeSymbol(@"play.fill"), nil, &_slideshowHost);
-    [self.slideshowButton addTarget:self action:@selector(apollo_toggleSlideshow)
-                 forControlEvents:UIControlEventTouchUpInside];
-    self.slideshowButton.accessibilityLabel = @"Play slideshow";
-    [self.view addSubview:self.slideshowHost];
-
-    self.slideshowSpeedButton = ApolloGalleryChromeButton(ApolloGalleryChromeSymbol(@"timer"), nil, &_slideshowSpeedHost);
-    self.slideshowSpeedButton.showsMenuAsPrimaryAction = YES;
-    [self.view addSubview:self.slideshowSpeedHost];
 
     self.shareButton = ApolloGalleryChromeButton(ApolloGalleryChromeSymbol(@"square.and.arrow.up"), nil, &_shareHost);
     // A button-attached UIMenu, NOT a presented action sheet. That's what plays
@@ -1028,10 +1058,12 @@ static UIInterfaceOrientation ApolloGalleryInterfaceOrientationForDevice(UIDevic
 
     self.rotateOfferTargetOrientation = wanted;
     [self.rotateOfferButton setTitle:title forState:UIControlStateNormal];
-    if (self.rotateOfferButton.configuration) {
-        UIButtonConfiguration *configuration = self.rotateOfferButton.configuration;
-        configuration.title = title;
-        self.rotateOfferButton.configuration = configuration;
+    if (@available(iOS 15.0, *)) {
+        if (self.rotateOfferButton.configuration) {
+            UIButtonConfiguration *configuration = self.rotateOfferButton.configuration;
+            configuration.title = title;
+            self.rotateOfferButton.configuration = configuration;
+        }
     }
     if (self.rotateOfferHost.hidden) {
         self.rotateOfferHost.hidden = NO;
@@ -1133,7 +1165,7 @@ static UIInterfaceOrientation ApolloGalleryInterfaceOrientationForDevice(UIDevic
 
 - (void)apollo_layoutChrome {
     CGRect bounds = self.view.bounds;
-    UIEdgeInsets safe = self.view.safeAreaInsets;
+    UIEdgeInsets safe = ApolloDeviceChromeInsetsForView(self.view);
 
     CGFloat top = safe.top + 12.0;
     CGFloat side = MAX(16.0, safe.left + 16.0);
@@ -1155,18 +1187,17 @@ static UIInterfaceOrientation ApolloGalleryInterfaceOrientationForDevice(UIDevic
     }
     CGFloat counterWidth = 88.0;
     self.counterPill.frame = CGRectMake(trailing - controlGap - counterWidth, top, counterWidth, controlHeight);
-    self.statusPill.frame = CGRectMake((bounds.size.width - 156.0) / 2.0, CGRectGetMaxY(self.counterPill.frame) + 8.0, 156.0, 28.0);
-    // Below the main toolbar, clear of Done and the share/video controls.
-    CGFloat slideY = CGRectGetMaxY(self.counterPill.frame) + 8.0;
-    self.slideshowHost.frame = CGRectMake(side, slideY, iconSize, controlHeight);
-    self.slideshowSpeedHost.frame = CGRectMake(side + iconSize + controlGap, slideY, 74.0, controlHeight);
+    // A second row avoids crowding Done / counter / mute / share on phones.
+    self.slideshowHost.frame = CGRectMake(side, top + controlHeight + controlGap, iconSize, controlHeight);
+    self.slideshowSpeedHost.frame = CGRectMake(side + iconSize + controlGap, top + controlHeight + controlGap, 64.0, controlHeight);
+    self.statusPill.frame = CGRectMake(bounds.size.width - rightSide - 156.0, CGRectGetMaxY(self.counterPill.frame) + 8.0, 156.0, 28.0);
 
     CGFloat bottom = safe.bottom + 16.0;
     // Two different widths on purpose. The info panel keeps a readable line
     // length, so it stays capped; the transport is a scrubber and takes the
     // whole width it can get — capping it too is what left the controls
     // huddled in the left half of a landscape screen.
-    CGFloat availableWidth = bounds.size.width - side - rightSide;
+    CGFloat availableWidth = MAX(0.0, bounds.size.width - side - rightSide);
     CGFloat panelWidth = MIN(availableWidth, 460.0);
     CGFloat videoBarWidth = availableWidth;
     CGFloat textWidth = panelWidth - 24.0;
@@ -1364,6 +1395,8 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
         if (duration > 0.0 && current >= duration - 0.1) {
             [player seekToTime:kCMTimeZero];
         }
+        self.slideshowVideoPaused = NO;
+        [self apollo_currentCell].videoFinished = NO;
         [[self apollo_currentCell] playIfPossible];
     }
     [self apollo_refreshVideoBarNow];
@@ -1468,20 +1501,20 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
     self.chromeVisible = visible;
     CGFloat alpha = visible ? 1.0 : 0.0;
     void (^changes)(void) = ^{
+        self.slideshowHost.alpha = alpha;
+        self.slideshowSpeedHost.alpha = alpha;
         self.doneHost.alpha = alpha;
         self.shareHost.alpha = alpha;
         self.muteHost.alpha = alpha;
         self.counterPill.alpha = alpha;
-        self.slideshowHost.alpha = alpha;
-        self.slideshowSpeedHost.alpha = alpha;
         self.infoPanel.alpha = alpha;
         self.videoBarPill.alpha = alpha;
     };
+    self.slideshowHost.userInteractionEnabled = visible;
+    self.slideshowSpeedHost.userInteractionEnabled = visible;
     self.doneHost.userInteractionEnabled = visible;
     self.shareHost.userInteractionEnabled = visible;
     self.muteHost.userInteractionEnabled = visible;
-    self.slideshowHost.userInteractionEnabled = visible;
-    self.slideshowSpeedHost.userInteractionEnabled = visible;
     self.infoPanel.userInteractionEnabled = visible;
     self.videoBarPill.userInteractionEnabled = visible;
     if (visible) self.infoPanelAutoHidden = NO;   // `changes` puts its alpha back
@@ -1538,107 +1571,109 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
     return CGSizeMake(MAX(size.width, 1.0), MAX(size.height, 1.0));
 }
 
-#pragma mark Gallery Slideshow
+#pragma mark Slideshow
 
 - (void)apollo_updateSlideshowControls {
-    NSString *symbol = self.slideshowPlaying ? @"pause.fill" : @"play.fill";
-    [self.slideshowButton setImage:ApolloGalleryChromeSymbol(symbol) forState:UIControlStateNormal];
-    self.slideshowButton.accessibilityLabel = self.slideshowPlaying ? @"Pause slideshow" : @"Play slideshow";
-    NSString *speedTitle = [NSString stringWithFormat:@"%lds", (long)self.slideshowInterval];
-    [self.slideshowSpeedButton setTitle:speedTitle forState:UIControlStateNormal];
-    if (self.slideshowSpeedButton.configuration) {
-        UIButtonConfiguration *configuration = self.slideshowSpeedButton.configuration;
-        configuration.title = speedTitle;
-        self.slideshowSpeedButton.configuration = configuration;
-    }
-    NSMutableArray<UIMenuElement *> *options = [NSMutableArray array];
+    [self.slideshowButton setImage:ApolloGalleryChromeSymbol(self.slideshowRunning ? @"pause.fill" : @"play.fill")
+                         forState:UIControlStateNormal];
+    self.slideshowButton.accessibilityLabel = self.slideshowRunning ? @"Pause slideshow" : @"Play slideshow";
+    [self.slideshowSpeedButton setTitle:[NSString stringWithFormat:@"%g s", self.slideshowInterval]
+                              forState:UIControlStateNormal];
+    NSMutableArray<UIMenuElement *> *actions = [NSMutableArray array];
+    __weak typeof(self) weakSelf = self;
     for (NSNumber *seconds in @[@1, @2, @3, @5, @10]) {
-        NSInteger value = seconds.integerValue;
-        __weak typeof(self) weakSelf = self;
-        UIAction *action = [UIAction actionWithTitle:[NSString stringWithFormat:@"%ld second%@", (long)value, value == 1 ? @"" : @"s"]
-                                                image:nil identifier:nil handler:^(__kindof UIAction *selected) {
+        UIAction *action = [UIAction actionWithTitle:[NSString stringWithFormat:@"%@ seconds", seconds]
+                                             image:nil identifier:nil handler:^(__kindof UIAction *selected) {
+            (void)selected;
             typeof(self) strongSelf = weakSelf;
-            if (!strongSelf) return;
-            strongSelf.slideshowInterval = value;
+            strongSelf.slideshowInterval = seconds.doubleValue;
+            strongSelf.slideshowDeadline = CACurrentMediaTime() + seconds.doubleValue;
             [strongSelf apollo_updateSlideshowControls];
-            if (strongSelf.slideshowPlaying) [strongSelf apollo_scheduleSlideshowTick];
         }];
-        action.state = (self.slideshowInterval == value) ? UIMenuElementStateOn : UIMenuElementStateOff;
-        [options addObject:action];
+        action.state = self.slideshowInterval == seconds.doubleValue ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [actions addObject:action];
     }
-    self.slideshowSpeedButton.menu = [UIMenu menuWithTitle:@"Slideshow speed" children:options];
+    self.slideshowSpeedButton.menu = [UIMenu menuWithTitle:@"Slideshow interval" children:actions];
 }
 
-- (void)apollo_stopSlideshow {
+- (void)apollo_pauseSlideshow {
+    if (!self.slideshowRunning) return;
+    self.slideshowRunning = NO;
+    self.slideshowVideoPaused = YES;
     [self.slideshowTimer invalidate];
     self.slideshowTimer = nil;
-    if (self.slideshowVideoEndObserver) {
-        [[NSNotificationCenter defaultCenter] removeObserver:self.slideshowVideoEndObserver];
-        self.slideshowVideoEndObserver = nil;
-    }
-    [self apollo_currentCell].slideshowWaitForVideo = NO;
-    self.slideshowPlaying = NO;
+    ApolloGalleryViewerCell *cell = [self apollo_currentCell];
+    cell.slideshowOwnsVideoEnd = NO;
+    [cell pausePlayback];
     [self apollo_updateSlideshowControls];
 }
 
-- (void)apollo_scheduleSlideshowTick {
-    [self.slideshowTimer invalidate];
-    self.slideshowTimer = nil;
-    if (self.slideshowVideoEndObserver) {
-        [[NSNotificationCenter defaultCenter] removeObserver:self.slideshowVideoEndObserver];
-        self.slideshowVideoEndObserver = nil;
+- (void)apollo_toggleSlideshow {
+    if (self.slideshowRunning) {
+        [self apollo_pauseSlideshow];
+        return;
+    }
+    if (!self.feed.items.count) return;
+    self.slideshowRunning = YES;
+    self.slideshowVideoPaused = NO;
+    self.slideshowDeadline = CACurrentMediaTime() + self.slideshowInterval;
+    ApolloGalleryViewerCell *cell = [self apollo_currentCell];
+    if (cell.videoFinished) {
+        cell.videoFinished = NO;
+        [cell.player seekToTime:kCMTimeZero];
+    }
+    [self apollo_syncPlayback];
+    [self apollo_updateSlideshowControls];
+    __weak typeof(self) weakSelf = self;
+    self.slideshowTimer = [NSTimer timerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *timer) {
+        (void)timer;
+        [weakSelf apollo_slideshowTick];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:self.slideshowTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)apollo_slideshowTick {
+    if (!self.slideshowRunning) return;
+    if (!self.view.window || self.presentedViewController || self.mediaMenuSession || self.isDismissing ||
+        UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
+        [self apollo_pauseSlideshow];
+        return;
     }
     ApolloGalleryViewerCell *cell = [self apollo_currentCell];
-    cell.slideshowWaitForVideo = NO;
-    if (!self.slideshowPlaying || self.feed.items.count < 2) return;
-    if ([self apollo_currentItem].playsAsVideo) {
-        cell.slideshowWaitForVideo = YES;
-        AVPlayerItem *playerItem = cell.player.currentItem;
-        if (playerItem) {
-            __weak typeof(self) weakSelf = self;
-            self.slideshowVideoEndObserver = [[NSNotificationCenter defaultCenter]
-                addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
-                            object:playerItem queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *note) {
-                typeof(self) strongSelf = weakSelf;
-                if (!strongSelf || !strongSelf.slideshowPlaying ||
-                    [strongSelf apollo_currentCell].player.currentItem != note.object) return;
-                [strongSelf apollo_slideshowAdvance];
-            }];
-        }
-        // Hosted video URLs can resolve asynchronously. Wait for the player,
-        // never advance on a timer while the current item is a video.
+    // Give every manually selected image a full interval after interaction.
+    if (self.collectionView.isDragging || self.collectionView.isDecelerating || cell.isZoomed ||
+        cell.zoomView.isDragging || cell.zoomView.isZooming ||
+        self.videoScrubbing || self.gestureScrubArmed || self.dismissPan.state == UIGestureRecognizerStateChanged) {
+        self.slideshowDeadline = CACurrentMediaTime() + self.slideshowInterval;
         return;
     }
-    self.slideshowTimer = [NSTimer scheduledTimerWithTimeInterval:self.slideshowInterval
-                                                          target:self selector:@selector(apollo_slideshowTick:)
-                                                        userInfo:nil repeats:NO];
-}
-
-- (void)apollo_toggleSlideshow {
-    if (self.slideshowPlaying) {
-        [self apollo_stopSlideshow];
-    } else if (self.feed.items.count > 1) {
-        self.slideshowPlaying = YES;
-        [self apollo_updateSlideshowControls];
-        [self apollo_scheduleSlideshowTick];
-    }
-}
-
-- (void)apollo_slideshowTick:(NSTimer *)timer {
-    if (!self.slideshowPlaying || self.isDismissing || self.feed.items.count < 2) {
-        [self apollo_stopSlideshow];
+    if (!cell) return;
+    ApolloGalleryItem *item = [self apollo_currentItem];
+    if (item.playsAsVideo) {
+        // Never substitute a wall-clock timeout for video completion. Slow,
+        // resolving, buffering, paused and failed clips stay on screen.
+        cell.slideshowOwnsVideoEnd = YES;
+    } else if (!cell.fullImageLoaded) {
+        self.slideshowDeadline = CACurrentMediaTime() + self.slideshowInterval;
         return;
     }
-    [self apollo_slideshowAdvance];
-}
-
-- (void)apollo_slideshowAdvance {
-    if (!self.slideshowPlaying || self.feed.items.count < 2) return;
-    NSInteger next = (self.currentIndex + 1) % (NSInteger)self.feed.items.count;
-    CGFloat width = MAX(self.collectionView.bounds.size.width, 1.0);
-    [self.collectionView setContentOffset:CGPointMake(width * next, 0.0) animated:NO];
-    [self apollo_scheduleSlideshowTick];
+    if (!ApolloGallerySlideshowCanAdvance(item.playsAsVideo, cell.videoFinished,
+                                          cell.fullImageLoaded, CACurrentMediaTime(), self.slideshowDeadline)) return;
+    NSInteger count = (NSInteger)self.feed.items.count;
+    if (!count || count != [self.collectionView numberOfItemsInSection:0]) return;
+    NSInteger next = (NSInteger)ApolloGallerySlideshowNextIndex((size_t)self.currentIndex, (size_t)count);
+    if (next == self.currentIndex) {
+        cell.videoFinished = NO;
+        [cell.player seekToTime:kCMTimeZero];
+        [cell playIfPossible];
+    } else {
+        // A nonanimated page change shares the native pager's index, chrome,
+        // prefetch and load-more path without intermediate-video playback.
+        [self.collectionView setContentOffset:CGPointMake(self.collectionView.bounds.size.width * next, 0) animated:NO];
+        [self.collectionView layoutIfNeeded];
+        [self apollo_syncPlayback];
+    }
+    self.slideshowDeadline = CACurrentMediaTime() + self.slideshowInterval;
 }
 
 #pragma mark Paging
@@ -1658,6 +1693,8 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
     page = MAX(0, MIN(page, (NSInteger)self.feed.items.count - 1));
     if (page == self.currentIndex) return;
     self.currentIndex = page;
+    self.slideshowVideoPaused = NO;
+    self.slideshowDeadline = CACurrentMediaTime() + self.slideshowInterval;
     // A different post carries different details, so it starts with its card
     // showing even if the last one's was dismissed.
     self.infoPanelHiddenForItem = NO;
@@ -1668,7 +1705,6 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
     [self apollo_scheduleInfoPanelAutoHide];
     [self apollo_updateChromeContent];
     [self apollo_syncPlayback];
-    if (self.slideshowPlaying) [self apollo_scheduleSlideshowTick];
     [self apollo_prefetchAroundIndex:page];
     [self apollo_loadMoreIfNeeded];
 }
@@ -1677,18 +1713,28 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
 // paging collection view keeps alive) gets paused, so audio can't stack up.
 - (void)apollo_syncPlayback {
     ApolloGalleryItem *currentItem = [self apollo_currentItem];
-    if (currentItem.needsHostedVideoResolution && !currentItem.isHostedVideoResolving) {
+    // Join a lookup that is already running too: the grid starts one for an
+    // on-screen tile with nothing else to play, and the tap that opened this
+    // viewer often lands while it is still in flight. Skipping it would leave
+    // this page on its poster, since nothing else tells it when that lands.
+    if (currentItem.needsHostedVideoResolution && ![self.hostedLookupsAwaited containsObject:currentItem]) {
+        if (!self.hostedLookupsAwaited) self.hostedLookupsAwaited = [NSMutableSet set];
+        [self.hostedLookupsAwaited addObject:currentItem];
         __weak typeof(self) weakSelf = self;
         [currentItem resolveHostedVideoWithCompletion:^(BOOL resolvedOriginal) {
             typeof(self) strongSelf = weakSelf;
+            [strongSelf.hostedLookupsAwaited removeObject:currentItem];
             if (!strongSelf || [strongSelf apollo_currentItem] != currentItem) return;
             ApolloGalleryViewerCell *currentCell = [strongSelf apollo_currentCell];
-            [currentCell replaceVideoURL:currentItem.videoURL andPlay:YES];
+            // A resolver may finish while the app is covered or backgrounded.
+            BOOL visible = !strongSelf.slideshowVideoPaused && strongSelf.view.window && !strongSelf.presentedViewController &&
+                UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+            currentCell.slideshowOwnsVideoEnd = strongSelf.slideshowRunning;
+            [currentCell replaceVideoURL:currentItem.videoURL andPlay:visible];
             [strongSelf apollo_updateChromeContent];
             // The resolution just swapped in a fresh player; repoint the
             // transport at it (the pre-resolution bind saw nil).
             [strongSelf apollo_bindVideoBarToPlayer:currentCell.player];
-            if (strongSelf.slideshowPlaying) [strongSelf apollo_scheduleSlideshowTick];
             if (!resolvedOriginal && !currentItem.videoURL) {
                 [strongSelf apollo_showToast:@"Couldn't load video"];
             }
@@ -1699,8 +1745,17 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
         if (![cell isMemberOfClass:[ApolloGalleryViewerCell class]]) continue;
         ApolloGalleryViewerCell *viewerCell = (ApolloGalleryViewerCell *)cell;
         NSIndexPath *indexPath = [self.collectionView indexPathForCell:cell];
-        if (indexPath.item == self.currentIndex) {
-            [viewerCell playIfPossible];
+        viewerCell.slideshowOwnsVideoEnd = self.slideshowRunning && indexPath.item == self.currentIndex;
+        if (indexPath.item == self.currentIndex && !self.slideshowVideoPaused) {
+            // A page configured while its host lookup was still running holds
+            // no stream, and if the reader paged away before the lookup landed,
+            // its completion skipped this page. Pick up what it produced.
+            if (!viewerCell.videoURL && currentItem.playsAsVideo && !currentItem.needsHostedVideoResolution &&
+                currentItem.videoURL) {
+                [viewerCell replaceVideoURL:currentItem.videoURL andPlay:YES];
+            } else {
+                [viewerCell playIfPossible];
+            }
         } else {
             [viewerCell pausePlayback];
         }
@@ -1788,7 +1843,7 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
 #pragma mark Gestures
 
 - (void)apollo_singleTapped:(UITapGestureRecognizer *)recognizer {
-    if (recognizer.state != UIGestureRecognizerStateRecognized) return;
+    if (recognizer.state != UIGestureRecognizerStateRecognized || self.mediaMenuSession) return;
     [self apollo_setChromeVisible:!self.chromeVisible animated:YES];
 }
 
@@ -1799,13 +1854,15 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
 
     switch (recognizer.state) {
         case UIGestureRecognizerStateBegan: {
+            if (self.mediaMenuSession || self.presentedViewController || self.isDismissing) return;
+            self.mediaHoldPoint = [recognizer locationInView:self.view];
             if (!scrubbable) {
                 // Still pictures keep the original hold-for-actions.
-                [self apollo_presentActionsFromView:self.view];
+                [self apollo_presentActionsFromView:self.collectionView];
                 return;
             }
             // Arm, but don't commit: a hold that never moves is still the
-            // actions sheet, so the old gesture isn't lost.
+            // actions menu, so the old gesture isn't lost.
             self.gestureScrubArmed = YES;
             self.gestureScrubActive = NO;
             self.gestureScrubStartX = [recognizer locationInView:self.view].x;
@@ -1817,7 +1874,7 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
             // had started on this touch, so the horizontal scrub can't also
             // turn the page.
             self.collectionView.scrollEnabled = NO;
-            // The sheet opens while the finger is still down, like a
+            // The menu opens while the finger is still down, like a
             // picture's hold and Apollo's own viewer, once the hold has
             // stayed still a moment past arming; that moment is the window
             // for starting a scrub. It used to wait for the lift (#1176).
@@ -1860,9 +1917,9 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
             if (!wasArmed) return;
             self.collectionView.scrollEnabled = YES;
             if (!wasActive) {
-                // Lifted without dragging before the sheet opened on its own.
+                // Lifted without dragging before the menu opened on its own.
                 if (recognizer.state == UIGestureRecognizerStateEnded) {
-                    [self apollo_presentActionsFromView:self.view];
+                    [self apollo_presentActionsFromView:self.collectionView];
                 }
                 return;
             }
@@ -1893,17 +1950,17 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
 }
 
 // The delayed half of a video-page hold: still armed and never dragged, so it
-// was a hold for the actions sheet after all.
+// was a hold for the actions menu after all.
 - (void)apollo_holdStayedStillForGeneration:(NSUInteger)generation {
     // A newer hold, or this one already lifted, was cancelled, or became a scrub.
     if (generation != self.gestureScrubHoldGeneration) return;
     if (!self.gestureScrubArmed || self.gestureScrubActive || self.presentedViewController) return;
-    // Disarm before presenting: the rest of this touch belongs to the sheet,
+    // Disarm before presenting: the rest of this touch belongs to the menu,
     // so a drag now can't start scrubbing and the lift can't open a second one.
     self.gestureScrubArmed = NO;
     self.collectionView.scrollEnabled = YES;
-    ApolloLog(@"[Gallery] viewer hold stayed still; opening the actions sheet");
-    [self apollo_presentActionsFromView:self.view];
+    ApolloLog(@"[Gallery] viewer hold stayed still; opening the actions menu");
+    [self apollo_presentActionsFromView:self.collectionView];
 }
 
 - (ApolloGalleryViewerCell *)apollo_currentCell {
@@ -1919,7 +1976,10 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
             // Toggling scrollEnabled cancels any paging drag UIKit had started
             // on the same touch, so a diagonal flick can't page AND dismiss.
             self.collectionView.scrollEnabled = NO;
-                    [UIView animateWithDuration:0.15 animations:^{
+            // Reveal the current page's tile, even if the user paged away
+            // from the image that originally opened the viewer.
+            [self apollo_notifyWillDismiss];
+            [UIView animateWithDuration:0.15 animations:^{
                 self.doneHost.alpha = 0.0;
                 self.shareHost.alpha = 0.0;
                 self.muteHost.alpha = 0.0;
@@ -1943,9 +2003,10 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
                           (fabs(translation.y) > kApolloGalleryViewerDismissDistance ||
                            fabs(velocity) > kApolloGalleryViewerDismissVelocity);
             if (commit) {
-                // Keep flying in the direction the finger was already going.
+                // Keep the original slide-away motion, revealing the retained
+                // grid with only a brief backdrop fade near the end.
                 CGFloat direction = (translation.y != 0.0 ? translation.y : velocity) < 0.0 ? -1.0 : 1.0;
-                [self apollo_dismissWithFlickDirection:direction];
+                [self apollo_dismissToGalleryWithFlickDirection:direction completion:nil];
             } else {
                 self.collectionView.scrollEnabled = YES;
                 [UIView animateWithDuration:0.28
@@ -1966,20 +2027,38 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
     }
 }
 
-- (void)apollo_dismissWithFlickDirection:(CGFloat)direction {
-    if (self.isDismissing) return;
+// Keep the destination mounted throughout the original fly-away animation.
+// The backdrop clears only near the end, so it reveals the grid rather than
+// leaving a black window while UIKit restores a removed presenting view.
+- (void)apollo_dismissToGalleryWithFlickDirection:(CGFloat)direction completion:(dispatch_block_t)completion {
+    if (self.isDismissing || self.mediaMenuSession) return;
     self.isDismissing = YES;
+    self.view.userInteractionEnabled = NO;
     [self apollo_notifyWillDismiss];
-    CGFloat offscreen = direction * (self.view.bounds.size.height + 80.0);
-    [UIView animateWithDuration:0.22
-                          delay:0.0
-                        options:UIViewAnimationOptionCurveEaseOut
-                     animations:^{
-        self.collectionView.transform = CGAffineTransformMakeTranslation(0.0, offscreen);
-        self.view.backgroundColor = UIColor.clearColor;
-    } completion:^(BOOL finished) {
-        [self dismissViewControllerAnimated:NO completion:nil];
-    }];
+    void (^finish)(BOOL) = ^(BOOL finished) {
+        [self dismissViewControllerAnimated:NO completion:^{
+            // Route Open Post first so playback cannot restart behind it.
+            if (completion) completion();
+            id<ApolloGalleryImageViewerDelegate> delegate = self.galleryDelegate;
+            if ([delegate respondsToSelector:@selector(galleryViewerDidDismiss:)]) {
+                [delegate galleryViewerDidDismiss:self];
+            }
+        }];
+    };
+    if (direction != 0.0 && !UIAccessibilityIsReduceMotionEnabled()) {
+        CGFloat offscreen = direction * (self.view.bounds.size.height + 80.0);
+        [UIView animateKeyframesWithDuration:0.22 delay:0.0 options:0 animations:^{
+            [UIView addKeyframeWithRelativeStartTime:0.0 relativeDuration:1.0 animations:^{
+                self.collectionView.transform = CGAffineTransformMakeTranslation(0.0, offscreen);
+            }];
+            [UIView addKeyframeWithRelativeStartTime:0.45 relativeDuration:0.55 animations:^{
+                self.view.backgroundColor = UIColor.clearColor;
+            }];
+        } completion:finish];
+    } else {
+        // Done has no drag direction; a short fade also honors Reduce Motion.
+        [UIView animateWithDuration:0.16 animations:^{ self.view.alpha = 0.0; } completion:finish];
+    }
 }
 
 - (void)apollo_notifyWillDismiss {
@@ -1990,15 +2069,13 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
 }
 
 - (void)apollo_donePressed {
-    if (self.isDismissing) return;
-    self.isDismissing = YES;
-    [self apollo_notifyWillDismiss];
-    [self dismissViewControllerAnimated:YES completion:nil];
+    [self apollo_dismissToGalleryWithFlickDirection:0.0 completion:nil];
 }
 
 #pragma mark UIGestureRecognizerDelegate
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (self.mediaMenuSession) return NO;
     // The card's swipe is horizontal-only, so it and the viewer's vertical
     // swipe-to-close can never both claim the same drag.
     if (gestureRecognizer == self.infoPan) {
@@ -2006,10 +2083,8 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
         return fabs(velocity.x) > fabs(velocity.y);
     }
     if (gestureRecognizer != self.dismissPan) return YES;
-    // A hold that opened the actions sheet keeps its touch, and that drag must
-    // not start closing the viewer under the sheet: the flick's dismiss would
-    // take down the sheet (our presented child) instead of the viewer, leaving
-    // it black with isDismissing stuck and Done dead.
+    // A share sheet also owns presentation: swiping underneath it must not
+    // dismiss the child instead of the viewer and leave Done in a stuck state.
     if (self.presentedViewController) return NO;
     // A zoomed-in page pans its own content instead.
     if ([self apollo_currentCell].isZoomed) return NO;
@@ -2027,6 +2102,10 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
        shouldReceiveTouch:(UITouch *)touch {
+    if ([touch.view isDescendantOfView:self.slideshowHost] ||
+        [touch.view isDescendantOfView:self.slideshowSpeedHost]) return NO;
+
+    if (self.mediaMenuSession) return NO;
     // The card's own tap (open post) must not fire when the touch is on its
     // × — that button dismisses the card instead.
     if (gestureRecognizer == self.infoTap || gestureRecognizer == self.infoPan) return YES;
@@ -2162,9 +2241,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
     }];
 }
 
-// The share button's actions as a UIMenu. Same set as the long-press sheet;
-// as a menu it gets the iOS 26 morph out of the button for free, and on older
-// releases it's still a native menu rather than a modal sheet.
+// The share button keeps its media actions and viewer-specific info toggle.
+// UIKit animates this menu from the button; media holds are anchored separately
+// at the finger so they also leave room for hold-and-drag video scrubbing.
 - (UIMenu *)apollo_buildActionsMenu {
     ApolloGalleryItem *item = [self apollo_currentItem];
     if (!item) return [UIMenu menuWithTitle:@"" children:@[]];
@@ -2225,56 +2304,42 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 }
 
 - (void)apollo_presentActionsFromView:(UIView *)sourceView {
-    // Never over a swipe-to-close already under way, for the same reason the
-    // dismiss pan won't start under a presented sheet.
     UIGestureRecognizerState dismissState = self.dismissPan.state;
-    if (self.isDismissing || dismissState == UIGestureRecognizerStateBegan ||
-        dismissState == UIGestureRecognizerStateChanged) return;
+    if (self.isDismissing || self.mediaMenuSession || self.presentedViewController ||
+        dismissState == UIGestureRecognizerStateBegan || dismissState == UIGestureRecognizerStateChanged) return;
     ApolloGalleryItem *item = [self apollo_currentItem];
     if (!item) return;
 
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:item.postTitle
-                                                                   message:nil
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    ApolloGalleryMediaActions *session = [[ApolloGalleryMediaActions alloc] initWithItem:item
+                                                                              presenter:self
+                                                                             sourceView:sourceView];
+    NSURL *postURL = session.item.postURL;
     __weak typeof(self) weakSelf = self;
-    if (item.playsAsVideo) {
-        if (item.videoDownloadURL) {
-            [sheet addAction:[UIAlertAction actionWithTitle:@"Save Video" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-                [weakSelf apollo_saveCurrentVideo];
-            }]];
+    session.openPostHandler = ^{ [weakSelf apollo_openPostURL:postURL]; };
+    self.mediaMenuSession = session;
+    // Native context menus do not present a child view controller. Explicitly
+    // hold the pager and dismiss gestures until UIKit's dismissal completes.
+    self.collectionView.scrollEnabled = NO;
+    // The source must be inside this controller's root view. A proxy beside
+    // the root lands in UIKit's modal transition container, whose responder
+    // chain cannot resolve the viewer as the menu's presentation owner.
+    CGPoint point = [self.view convertPoint:self.mediaHoldPoint toView:sourceView];
+    BOOL presented = ApolloNativeActionMenuPresentCapturedAtPoint([session menu], sourceView, point, session, ^{
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf.mediaMenuSession == session) {
+            strongSelf.mediaMenuSession = nil;
+            strongSelf.collectionView.scrollEnabled = YES;
         }
-        NSURL *shareURL = item.videoURL ?: item.hostedVideoPageURL;
-        if (shareURL) {
-            [sheet addAction:[UIAlertAction actionWithTitle:@"Share Video Link" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-                [weakSelf apollo_presentActivityWithItems:@[shareURL] fromView:sourceView];
-            }]];
-        }
+        [session menuDidEnd];
+    });
+    if (presented) {
+        ApolloNativeActionMenuPreviewFeedback(sourceView, point);
+        ApolloLog(@"[Gallery] opened native media menu (page %ld)", (long)self.currentIndex);
     } else {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Save Image" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            [weakSelf apollo_saveCurrentImage];
-        }]];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Share Image" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            [weakSelf apollo_shareCurrentImageFromView:sourceView];
-        }]];
+        self.mediaMenuSession = nil;
+        self.collectionView.scrollEnabled = YES;
+        ApolloLog(@"[Gallery] native media menu could not open");
     }
-    if (item.postURL) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Share Post Link" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            [weakSelf apollo_sharePostLinkFromView:sourceView];
-        }]];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Open Post" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            [weakSelf apollo_openCurrentPost];
-        }]];
-    }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover) {
-        popover.sourceView = sourceView ?: self.view;
-        popover.sourceRect = (sourceView && sourceView != self.view)
-            ? sourceView.bounds
-            : CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1.0, 1.0);
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 // Original bytes when we still have them (a GIF stays animated), otherwise a
@@ -2396,19 +2461,19 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 // first: routing a URL while a fullscreen modal is up would push the post
 // behind it.
 - (void)apollo_openCurrentPost {
-    NSURL *postURL = [self apollo_currentItem].postURL;
-    if (!postURL) return;
-    if (!self.isDismissing) {
-        self.isDismissing = YES;
-        [self apollo_notifyWillDismiss];
-    }
-    [self dismissViewControllerAnimated:YES completion:^{
+    [self apollo_openPostURL:[self apollo_currentItem].postURL];
+}
+
+- (void)apollo_openPostURL:(NSURL *)postURL {
+    UIWindowScene *originatingScene = self.viewIfLoaded.window.windowScene;
+    if (!postURL || !originatingScene || self.isDismissing || self.mediaMenuSession) return;
+    [self apollo_dismissToGalleryWithFlickDirection:0.0 completion:^{
         // Apollo's URL handler only acts on apollo:// URLs — handing it the raw
         // https reddit.com link is silently ignored. The scheme conversion is
         // what every other in-app route in the tweak goes through.
-        if (ApolloRouteResolvedURLViaApolloScheme(postURL)) return;
-        if (!ApolloRouteURLThroughApp(postURL)) {
-            ApolloLog(@"[Gallery] couldn't route %@ through the app", postURL.absoluteString);
+        NSURL *nativeURL = ApolloURLByConvertingResolvedURLToApolloScheme(postURL) ?: postURL;
+        if (!ApolloRouteURLThroughAppInScene(nativeURL, originatingScene)) {
+            ApolloLog(@"[Gallery] native post route unavailable");
         }
     }];
 }
