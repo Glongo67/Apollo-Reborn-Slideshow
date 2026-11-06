@@ -4,6 +4,7 @@
 #import "ApolloGalleryPinchIntroduction.h"
 #import "ApolloGalleryFeed.h"
 #import "ApolloGalleryPostDate.h"
+#import "ApolloGalleryResolution.h"
 #import "ApolloGalleryGridGeometry.h"
 #import "ApolloGallerySource.h"
 #import "ApolloAccountCredentials.h"
@@ -231,6 +232,7 @@ static void ApolloGalleryTileSetAnimation(UIImageView *imageView, id animatedIma
 
 // KVO context for the tile's AVPlayerItem status (see apollo_startPlayerWithURL:).
 static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatusContext;
+static void *kApolloGalleryTileResolutionContext = &kApolloGalleryTileResolutionContext;
 
 @interface ApolloGalleryTileCell : UICollectionViewCell
 @property (nonatomic, strong) UIImageView *imageView;
@@ -238,6 +240,7 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
 @property (nonatomic, strong) UILabel *blurLabel;
 @property (nonatomic, strong) UILabel *badgeLabel;
 @property (nonatomic, strong) UILabel *dateLabel;
+@property (nonatomic, strong) UILabel *resolutionLabel;
 @property (nonatomic, strong, nullable) ApolloGalleryImageRequest *request;
 @property (nonatomic, copy, nullable) NSURL *thumbnailURL;
 @property (nonatomic, strong, nullable) ApolloGalleryItem *item;
@@ -267,6 +270,7 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
 // Playing, or still fetching what it will play; both count against the cap.
 @property (nonatomic, readonly, getter=isPlaying) BOOL playing;
 - (void)configureWithItem:(ApolloGalleryItem *)item;
+- (void)apollo_updateResolutionLabel;
 - (void)startPlayback;
 - (void)stopPlayback;
 @end
@@ -325,6 +329,19 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
         _dateLabel.userInteractionEnabled = NO;
         _dateLabel.hidden = YES;
         [self.contentView addSubview:_dateLabel];
+
+        _resolutionLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+        _resolutionLabel.textColor = UIColor.whiteColor;
+        _resolutionLabel.font = [UIFont monospacedDigitSystemFontOfSize:10.0 weight:UIFontWeightSemibold];
+        _resolutionLabel.textAlignment = NSTextAlignmentCenter;
+        _resolutionLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.65];
+        _resolutionLabel.layer.cornerRadius = 7.0;
+        _resolutionLabel.clipsToBounds = YES;
+        _resolutionLabel.adjustsFontSizeToFitWidth = YES;
+        _resolutionLabel.minimumScaleFactor = 0.75;
+        _resolutionLabel.userInteractionEnabled = NO;
+        _resolutionLabel.hidden = YES;
+        [self.contentView addSubview:_resolutionLabel];
     }
     return self;
 }
@@ -334,6 +351,7 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
     [self stopPlayback];
     [self.request cancel];
     self.request = nil;
+    [self.item removeObserver:self forKeyPath:@"mediaPixelSize" context:kApolloGalleryTileResolutionContext];
     self.item = nil;
     self.thumbnailURL = nil;
     ApolloGalleryTileSetAnimation(self.imageView, nil);
@@ -344,9 +362,13 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
     self.dateLabel.text = nil;
     self.dateLabel.accessibilityLabel = nil;
     self.dateLabel.hidden = YES;
+    self.resolutionLabel.text = nil;
+    self.resolutionLabel.accessibilityLabel = nil;
+    self.resolutionLabel.hidden = YES;
 }
 
 - (void)dealloc {
+    [self.item removeObserver:self forKeyPath:@"mediaPixelSize" context:kApolloGalleryTileResolutionContext];
     [self stopPlayback];
 }
 
@@ -375,10 +397,15 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
         dateY -= 24.0;
     }
     self.dateLabel.frame = CGRectMake(6.0, MAX(6.0, dateY), dateWidth, 20.0);
+    CGSize resolutionSize = [self.resolutionLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX)];
+    self.resolutionLabel.frame = CGRectMake(6.0, 6.0, MIN(availableWidth, ceil(resolutionSize.width)), 20.0);
 }
 
 - (void)configureWithItem:(ApolloGalleryItem *)item {
+    [self.item removeObserver:self forKeyPath:@"mediaPixelSize" context:kApolloGalleryTileResolutionContext];
     self.item = item;
+    [item addObserver:self forKeyPath:@"mediaPixelSize" options:0 context:kApolloGalleryTileResolutionContext];
+    [self apollo_updateResolutionLabel];
     NSString *postDate = ApolloGalleryPostDateText(item.postDate);
     self.dateLabel.text = postDate ? [NSString stringWithFormat:@"  %@  ", postDate] : nil;
     self.dateLabel.accessibilityLabel = postDate ? [@"Post date: " stringByAppendingString:postDate] : nil;
@@ -403,6 +430,7 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
     }
     [self.contentView bringSubviewToFront:self.badgeLabel];
     [self.contentView bringSubviewToFront:self.dateLabel];
+    [self.contentView bringSubviewToFront:self.resolutionLabel];
     [self setNeedsLayout];
 
     NSURL *url = item.thumbnailURL ?: item.imageURL;
@@ -430,6 +458,15 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
         strongSelf.imageView.image = image;
         [UIView animateWithDuration:0.18 animations:^{ strongSelf.imageView.alpha = 1.0; }];
     }];
+}
+
+// Called on main for initial metadata and later hosted-video/player results.
+- (void)apollo_updateResolutionLabel {
+    NSString *text = ApolloGalleryResolutionText(self.item.mediaPixelSize);
+    self.resolutionLabel.text = text ? [NSString stringWithFormat:@"  %@  ", text] : nil;
+    self.resolutionLabel.accessibilityLabel = text ? [@"Resolution: " stringByAppendingString:text] : nil;
+    self.resolutionLabel.hidden = (text.length == 0);
+    [self setNeedsLayout];
 }
 
 #pragma mark Tile autoplay
@@ -519,6 +556,8 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
     if (self.observedPlayerItem) {
         [self.observedPlayerItem removeObserver:self forKeyPath:@"status"
                                         context:kApolloGalleryTileItemStatusContext];
+        [self.observedPlayerItem removeObserver:self forKeyPath:@"presentationSize"
+                                        context:kApolloGalleryTileItemStatusContext];
         self.observedPlayerItem = nil;
     }
     [self.player pause];
@@ -584,8 +623,11 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
     // sessions) only ever reaches AVPlayerItemStatusFailed — no notification —
     // so watch the status too. Stopping frees the tile's slot under the cap
     // instead of leaving a poster counted as playing for the whole visit.
-    [playerItem addObserver:self forKeyPath:@"status" options:0 context:kApolloGalleryTileItemStatusContext];
     self.observedPlayerItem = playerItem;
+    [playerItem addObserver:self forKeyPath:@"status" options:NSKeyValueObservingOptionInitial
+                   context:kApolloGalleryTileItemStatusContext];
+    [playerItem addObserver:self forKeyPath:@"presentationSize" options:0
+                   context:kApolloGalleryTileItemStatusContext];
 
     AVPlayerLayer *layer = [AVPlayerLayer playerLayerWithPlayer:player];
     layer.videoGravity = AVLayerVideoGravityResizeAspectFill;
@@ -603,11 +645,34 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
                       ofObject:(id)object
                         change:(NSDictionary<NSKeyValueChangeKey, id> *)change
                        context:(void *)context {
+    if (context == kApolloGalleryTileResolutionContext) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            // An async result for an old post must never label a recycled tile.
+            if (strongSelf.item == object) [strongSelf apollo_updateResolutionLabel];
+        });
+        return;
+    }
     if (context != kApolloGalleryTileItemStatusContext) {
         [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
         return;
     }
     AVPlayerItem *playerItem = object;
+    if (playerItem.status == AVPlayerItemStatusReadyToPlay) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf || strongSelf.observedPlayerItem != playerItem) return;
+            // Fill genuinely unknown sizes from the loaded video, never from
+            // a thumbnail. Keep a known source size when HLS picks a smaller
+            // rendition to suit the tile or current bandwidth.
+            CGSize size = playerItem.presentationSize;
+            if (!ApolloGalleryResolutionIsValid(strongSelf.item.mediaPixelSize) &&
+                ApolloGalleryResolutionIsValid(size)) strongSelf.item.mediaPixelSize = size;
+        });
+        return;
+    }
     if (playerItem.status != AVPlayerItemStatusFailed) return;
     NSError *error = playerItem.error;
     // KVO may arrive off the main thread; the teardown touches layers.

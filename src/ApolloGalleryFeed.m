@@ -2,6 +2,7 @@
 
 #import "ApolloGalleryFeed.h"
 #import "ApolloGalleryPostDate.h"
+#import "ApolloGalleryResolution.h"
 #import "ApolloAccountCredentials.h"
 #import "ApolloTagFilters.h"
 #import "ApolloCommon.h"
@@ -164,6 +165,8 @@ static BOOL ApolloGalleryURLLooksLikeImage(NSURL *url) {
         if (resolved) {
             // Hosted MP4s are self-contained, including their audio track.
             strongSelf.videoURL = mp4URL;
+            // A newly resolved original can differ from Reddit's preview.
+            strongSelf.mediaPixelSize = ApolloGalleryResolutionIsValid(pixelSize) ? pixelSize : CGSizeZero;
             strongSelf.videoDownloadURL = mp4URL;
             if (!strongSelf.imageURL && posterURL) strongSelf.imageURL = posterURL;
             if (CGSizeEqualToSize(strongSelf.pixelSize, CGSizeZero) &&
@@ -1091,6 +1094,7 @@ static CGFloat const kApolloGalleryThumbnailTargetWidth = 640.0;
         // the .gif; the grid tile plays that instead of decoding the GIF.
         if (animated) item.gifMP4URL = ApolloGalleryURL(source[@"mp4"]);
         item.pixelSize = CGSizeMake(ApolloGalleryNumber(source[@"x"]), ApolloGalleryNumber(source[@"y"]));
+        item.mediaPixelSize = ApolloGalleryResolutionFromValues(source[@"x"], source[@"y"]);
         // `p` holds the still previews; use one even for animated entries so the
         // grid doesn't pull a multi-megabyte GIF per tile.
         item.thumbnailURL = ApolloGalleryBestThumbnail(ApolloGalleryArray(media[@"p"]), @"u",
@@ -1220,6 +1224,10 @@ static NSURL *ApolloGalleryDirectVideoURL(NSURL *url) {
         item.videoDownloadURL = downloadable;
     }
     item.duration = duration;
+    // Match the selected video stream, never the poster's aspect/size. Direct
+    // hosted MP4s bypass Reddit's preview; their dimensions arrive on playback.
+    NSDictionary *streamMetadata = redditVideo ?: (isHostedDirectVideo ? nil : previewVideo);
+    item.mediaPixelSize = ApolloGalleryResolutionFromValues(streamMetadata[@"width"], streamMetadata[@"height"]);
     // The poster frame. Reddit usually supplies preview.images; external hosts
     // can instead put the still under oembed.thumbnail_url. Never resolve the
     // host API while parsing—that would fan one listing page out into dozens
@@ -1284,6 +1292,9 @@ static NSURL *ApolloGalleryDirectVideoURL(NSURL *url) {
         item.pixelSize = CGSizeMake(ApolloGalleryNumber(previewSource[@"width"]),
                                     ApolloGalleryNumber(previewSource[@"height"]));
     }
+    // Prefer the animated source dimensions when the media itself is a GIF.
+    NSDictionary *mediaSource = animated && gifVariantSource ? gifVariantSource : previewSource;
+    item.mediaPixelSize = ApolloGalleryResolutionFromValues(mediaSource[@"width"], mediaSource[@"height"]);
     item.thumbnailURL = ApolloGalleryBestThumbnail(ApolloGalleryArray(previewImage[@"resolutions"]), @"url",
                                                    kApolloGalleryThumbnailTargetWidth)
                         ?: (previewSource ? ApolloGalleryURL(previewSource[@"url"]) : full)

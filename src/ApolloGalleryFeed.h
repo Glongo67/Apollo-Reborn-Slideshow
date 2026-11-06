@@ -91,6 +91,9 @@ static ApolloGalleryMediaKind const ApolloGalleryMediaKindAll =
 // Source pixel dimensions, used to lay the masonry grid out before the image
 // has loaded. CGSizeZero when Reddit didn't report them.
 @property (nonatomic) CGSize pixelSize;
+// Media dimensions for display; unlike pixelSize these never describe a video poster.
+// CGSizeZero when the media metadata has not supplied a size.
+@property (nonatomic) CGSize mediaPixelSize;
 
 // Creation date of the displayed Reddit post (also for crossposts).
 @property (nonatomic, copy, nullable) NSDate *postDate;
