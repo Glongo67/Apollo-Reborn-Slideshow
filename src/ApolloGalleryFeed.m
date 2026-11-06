@@ -1,6 +1,7 @@
 // ApolloGalleryFeed.m — see ApolloGalleryFeed.h for the feature overview.
 
 #import "ApolloGalleryFeed.h"
+#import "ApolloGalleryPostDate.h"
 #import "ApolloAccountCredentials.h"
 #import "ApolloTagFilters.h"
 #import "ApolloCommon.h"
@@ -993,6 +994,7 @@ static NSString *ApolloGalleryBearerForClient(id client) {
 
 // Stamps the post-level fields every item from a post shares.
 static void ApolloGalleryApplyPostMetadata(ApolloGalleryItem *item, NSDictionary *post) {
+    item.postDate = ApolloGalleryPostDateFromTimestamp(post[@"created_utc"]);
     item.postTitle = ApolloGalleryString(post[@"title"]);
     item.author = ApolloGalleryString(post[@"author"]);
     item.subreddit = ApolloGalleryString(post[@"subreddit"]);

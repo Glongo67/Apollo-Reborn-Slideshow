@@ -3,6 +3,7 @@
 #import "ApolloGalleryViewController.h"
 #import "ApolloGalleryPinchIntroduction.h"
 #import "ApolloGalleryFeed.h"
+#import "ApolloGalleryPostDate.h"
 #import "ApolloGalleryGridGeometry.h"
 #import "ApolloGallerySource.h"
 #import "ApolloAccountCredentials.h"
@@ -236,6 +237,7 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
 @property (nonatomic, strong) UIVisualEffectView *blurView;
 @property (nonatomic, strong) UILabel *blurLabel;
 @property (nonatomic, strong) UILabel *badgeLabel;
+@property (nonatomic, strong) UILabel *dateLabel;
 @property (nonatomic, strong, nullable) ApolloGalleryImageRequest *request;
 @property (nonatomic, copy, nullable) NSURL *thumbnailURL;
 @property (nonatomic, strong, nullable) ApolloGalleryItem *item;
@@ -310,6 +312,19 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
         _badgeLabel.clipsToBounds = YES;
         _badgeLabel.hidden = YES;
         [self.contentView addSubview:_badgeLabel];
+
+        _dateLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+        _dateLabel.textColor = UIColor.whiteColor;
+        _dateLabel.font = [UIFont monospacedDigitSystemFontOfSize:11.0 weight:UIFontWeightSemibold];
+        _dateLabel.textAlignment = NSTextAlignmentCenter;
+        _dateLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.65];
+        _dateLabel.layer.cornerRadius = 7.0;
+        _dateLabel.clipsToBounds = YES;
+        _dateLabel.adjustsFontSizeToFitWidth = YES;
+        _dateLabel.minimumScaleFactor = 0.75;
+        _dateLabel.userInteractionEnabled = NO;
+        _dateLabel.hidden = YES;
+        [self.contentView addSubview:_dateLabel];
     }
     return self;
 }
@@ -326,6 +341,9 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
     self.imageView.alpha = 1.0;
     self.blurView.hidden = YES;
     self.badgeLabel.hidden = YES;
+    self.dateLabel.text = nil;
+    self.dateLabel.accessibilityLabel = nil;
+    self.dateLabel.hidden = YES;
 }
 
 - (void)dealloc {
@@ -348,10 +366,23 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
     self.badgeLabel.frame = CGRectMake(CGRectGetWidth(self.contentView.bounds) - badgeWidth - 6.0,
                                        CGRectGetHeight(self.contentView.bounds) - 20.0 - 6.0,
                                        badgeWidth, 20.0);
+    // Keep the date readable without covering a video-duration/GIF badge.
+    CGFloat availableWidth = MAX(0.0, CGRectGetWidth(self.contentView.bounds) - 12.0);
+    CGSize dateSize = [self.dateLabel sizeThatFits:CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX)];
+    CGFloat dateWidth = MIN(availableWidth, ceil(dateSize.width));
+    CGFloat dateY = CGRectGetHeight(self.contentView.bounds) - 26.0;
+    if (!self.badgeLabel.hidden && 6.0 + dateWidth + 6.0 > CGRectGetMinX(self.badgeLabel.frame)) {
+        dateY -= 24.0;
+    }
+    self.dateLabel.frame = CGRectMake(6.0, MAX(6.0, dateY), dateWidth, 20.0);
 }
 
 - (void)configureWithItem:(ApolloGalleryItem *)item {
     self.item = item;
+    NSString *postDate = ApolloGalleryPostDateText(item.postDate);
+    self.dateLabel.text = postDate ? [NSString stringWithFormat:@"  %@  ", postDate] : nil;
+    self.dateLabel.accessibilityLabel = postDate ? [@"Post date: " stringByAppendingString:postDate] : nil;
+    self.dateLabel.hidden = (postDate.length == 0);
     if (item.shouldBlurThumbnail) {
         self.blurView.hidden = NO;
         self.blurLabel.text = item.isSpoiler ? @"SPOILER" : @"NSFW";
@@ -371,6 +402,7 @@ static void *kApolloGalleryTileItemStatusContext = &kApolloGalleryTileItemStatus
         self.badgeLabel.hidden = NO;
     }
     [self.contentView bringSubviewToFront:self.badgeLabel];
+    [self.contentView bringSubviewToFront:self.dateLabel];
     [self setNeedsLayout];
 
     NSURL *url = item.thumbnailURL ?: item.imageURL;

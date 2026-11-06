@@ -92,6 +92,8 @@ static ApolloGalleryMediaKind const ApolloGalleryMediaKindAll =
 // has loaded. CGSizeZero when Reddit didn't report them.
 @property (nonatomic) CGSize pixelSize;
 
+// Creation date of the displayed Reddit post (also for crossposts).
+@property (nonatomic, copy, nullable) NSDate *postDate;
 @property (nonatomic, copy, nullable) NSString *postTitle;
 @property (nonatomic, copy, nullable) NSString *author;      // no "u/" prefix
 @property (nonatomic, copy, nullable) NSString *subreddit;   // no "r/" prefix
