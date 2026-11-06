@@ -3,6 +3,7 @@
 #import "ApolloGalleryImageViewer.h"
 #import "ApolloGallerySlideshowPolicy.h"
 #import "ApolloGalleryFeed.h"
+#import "ApolloGalleryPostDate.h"
 #import "ApolloGalleryImageLoader.h"
 #import "ApolloCommon.h"
 #import "ApolloDeviceGeometry.h"
@@ -575,6 +576,10 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 @property (nonatomic) NSUInteger infoPanelAutoHideGeneration;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *subtitleLabel;
+// Independent of the auto-hidden title/transport chrome, so the post date
+// stays readable throughout a slideshow, including video pages.
+@property (nonatomic, strong) UILabel *postDateLabel;
+@property (nonatomic, strong) ApolloGalleryChromePillView *postDatePill;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) ApolloGalleryChromePillView *statusPill;
 @property (nonatomic, strong) UILabel *toastLabel;
@@ -898,6 +903,15 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
     self.counterPill = ApolloGalleryChromePill(self.counterLabel, 0.55);
     [self.view addSubview:self.counterPill];
 
+    self.postDateLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.postDateLabel.textColor = UIColor.whiteColor;
+    self.postDateLabel.font = [UIFont monospacedDigitSystemFontOfSize:13.0 weight:UIFontWeightSemibold];
+    self.postDateLabel.textAlignment = NSTextAlignmentCenter;
+    self.postDatePill = ApolloGalleryChromePill(self.postDateLabel, 0.65);
+    self.postDatePill.userInteractionEnabled = NO;
+    self.postDatePill.hidden = YES;
+    [self.view addSubview:self.postDatePill];
+
     self.shareButton = ApolloGalleryChromeButton(ApolloGalleryChromeSymbol(@"square.and.arrow.up"), nil, &_shareHost);
     // A button-attached UIMenu, NOT a presented action sheet. That's what plays
     // the iOS 26 morph out of the button; an alert-controller popover gets no
@@ -1190,7 +1204,10 @@ static UIInterfaceOrientation ApolloGalleryInterfaceOrientationForDevice(UIDevic
     // A second row avoids crowding Done / counter / mute / share on phones.
     self.slideshowHost.frame = CGRectMake(side, top + controlHeight + controlGap, iconSize, controlHeight);
     self.slideshowSpeedHost.frame = CGRectMake(side + iconSize + controlGap, top + controlHeight + controlGap, 64.0, controlHeight);
-    self.statusPill.frame = CGRectMake(bounds.size.width - rightSide - 156.0, CGRectGetMaxY(self.counterPill.frame) + 8.0, 156.0, 28.0);
+    CGFloat dateY = CGRectGetMaxY(self.counterPill.frame) + controlGap;
+    self.postDatePill.frame = CGRectMake(bounds.size.width - rightSide - 104.0, dateY, 104.0, 28.0);
+    CGFloat statusY = self.postDatePill.hidden ? dateY : CGRectGetMaxY(self.postDatePill.frame) + controlGap;
+    self.statusPill.frame = CGRectMake(bounds.size.width - rightSide - 156.0, statusY, 156.0, 28.0);
 
     CGFloat bottom = safe.bottom + 16.0;
     // Two different widths on purpose. The info panel keeps a readable line
@@ -1481,6 +1498,10 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
 
     ApolloGalleryItem *item = (index >= 0 && index < total) ? items[index] : nil;
     self.titleLabel.text = item.postTitle ?: @"";
+    NSString *postDate = ApolloGalleryPostDateText(item.postDate);
+    self.postDateLabel.text = postDate;
+    self.postDateLabel.accessibilityLabel = postDate ? [@"Post date: " stringByAppendingString:postDate] : nil;
+    self.postDatePill.hidden = (postDate.length == 0);
     [self apollo_updateMuteButton];
 
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
@@ -1501,6 +1522,7 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
     self.chromeVisible = visible;
     CGFloat alpha = visible ? 1.0 : 0.0;
     void (^changes)(void) = ^{
+        self.postDatePill.alpha = 1.0;
         self.slideshowHost.alpha = alpha;
         self.slideshowSpeedHost.alpha = alpha;
         self.doneHost.alpha = alpha;
@@ -1980,6 +2002,7 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
             // from the image that originally opened the viewer.
             [self apollo_notifyWillDismiss];
             [UIView animateWithDuration:0.15 animations:^{
+                self.postDatePill.alpha = 0.0;
                 self.doneHost.alpha = 0.0;
                 self.shareHost.alpha = 0.0;
                 self.muteHost.alpha = 0.0;
