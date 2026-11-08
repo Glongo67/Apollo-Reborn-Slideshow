@@ -462,9 +462,9 @@ static void *kApolloGalleryTileResolutionContext = &kApolloGalleryTileResolution
 
 // Called on main for initial metadata and later hosted-video/player results.
 - (void)apollo_updateResolutionLabel {
-    NSString *text = ApolloGalleryResolutionText(self.item.mediaPixelSize);
+    NSString *text = ApolloGalleryResolutionQualityText(self.item.mediaPixelSize);
     self.resolutionLabel.text = text ? [NSString stringWithFormat:@"  %@  ", text] : nil;
-    self.resolutionLabel.accessibilityLabel = text ? [@"Resolution: " stringByAppendingString:text] : nil;
+    self.resolutionLabel.accessibilityLabel = text ? [@"Resolution quality: " stringByAppendingString:text] : nil;
     self.resolutionLabel.hidden = (text.length == 0);
     [self setNeedsLayout];
 }

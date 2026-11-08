@@ -4,6 +4,7 @@
 #import "ApolloGallerySlideshowPolicy.h"
 #import "ApolloGalleryFeed.h"
 #import "ApolloGalleryPostDate.h"
+#import "ApolloGalleryResolution.h"
 #import "ApolloGalleryImageLoader.h"
 #import "ApolloCommon.h"
 #import "ApolloDeviceGeometry.h"
@@ -33,6 +34,9 @@ static NSInteger const kApolloGalleryViewerLoadAheadSlack = 4;
 // much longer (seconds), it opens the actions menu instead. Pictures, which
 // can't scrub, open it the moment the hold registers.
 static NSTimeInterval const kApolloGalleryViewerHoldActionsDelay = 0.3;
+
+static void *kApolloGalleryViewerResolutionContext = &kApolloGalleryViewerResolutionContext;
+static void *kApolloGalleryViewerPresentationContext = &kApolloGalleryViewerPresentationContext;
 
 static NSString *const kApolloGalleryViewerCellID = @"ApolloGalleryViewerCell";
 
@@ -99,6 +103,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, strong, nullable) ApolloGalleryImageRequest *request;
 @property (nonatomic, copy, nullable) NSURL *imageURL;
+@property (nonatomic, strong, nullable) ApolloGalleryItem *representedItem;
 // Video side. The poster image stays underneath until the first frame is ready,
 // so paging onto a clip never flashes black.
 // The slideshow consumes the end event instead of the cell looping the clip.
@@ -194,6 +199,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
     [self.request cancel];
     self.request = nil;
     self.imageURL = nil;
+    self.representedItem = nil;
     [self teardownPlayer];
     [self apollo_displayImage:nil animation:nil];
     self.fullImageLoaded = NO;
@@ -338,6 +344,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 }
 
 - (void)configureWithItem:(ApolloGalleryItem *)item {
+    self.representedItem = item;
     NSURL *url = item.imageURL;
     self.imageURL = url;
     // Stash the stream URL only; playIfPossible builds the player when this
@@ -354,6 +361,9 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
     ApolloGalleryDecodedImage *full = url ? [[ApolloGalleryImageLoader sharedLoader] cachedImageForURL:url] : nil;
     [self apollo_displayImage:(full.image ?: placeholder) animation:full.animatedImage];
     self.fullImageLoaded = (full != nil);
+    if (full && !item.playsAsVideo) {
+        [self apollo_recordFullImageResolution:[[ApolloGalleryImageLoader sharedLoader] cachedDataForURL:url]];
+    }
     // The fit rect depends on the image's proportions, so re-derive it whenever
     // the displayed image changes — including the placeholder→full swap, which
     // can have a different aspect if Reddit's preview was cropped.
@@ -378,10 +388,22 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
         if (decoded) {
             [strongSelf apollo_displayImage:decoded.image animation:decoded.animatedImage];
             strongSelf.fullImageLoaded = YES;
+            [strongSelf apollo_recordFullImageResolution:data];
             [strongSelf apollo_resetZoomGeometry];
         }
         (void)data;
     }];
+}
+
+// A video's decoded image is only its poster. For still images/GIFs the
+// full-tier decoder can refine Reddit's metadata without extra requests.
+- (void)apollo_recordFullImageResolution:(NSData *)data {
+    ApolloGalleryItem *item = self.representedItem;
+    if (!data || !item || item.playsAsVideo) return;
+    CGSize pixels = ApolloGalleryResolutionFromImageData(data);
+    if (ApolloGalleryResolutionIsValid(pixels) && !CGSizeEqualToSize(pixels, item.mediaPixelSize)) {
+        item.mediaPixelSize = pixels;
+    }
 }
 
 - (void)replaceVideoURL:(NSURL *)videoURL andPlay:(BOOL)play {
@@ -576,10 +598,12 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 @property (nonatomic) NSUInteger infoPanelAutoHideGeneration;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *subtitleLabel;
-// Independent of the auto-hidden title/transport chrome, so the post date
-// stays readable throughout a slideshow, including video pages.
+// Independent of the auto-hidden title/transport chrome: post date and
+// precise media dimensions remain visible throughout the slideshow.
 @property (nonatomic, strong) UILabel *postDateLabel;
 @property (nonatomic, strong) ApolloGalleryChromePillView *postDatePill;
+@property (nonatomic, strong, nullable) ApolloGalleryItem *observedResolutionItem;
+@property (nonatomic, strong, nullable) AVPlayerItem *observedResolutionPlayerItem;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) ApolloGalleryChromePillView *statusPill;
 @property (nonatomic, strong) UILabel *toastLabel;
@@ -802,6 +826,10 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 }
 
 - (void)dealloc {
+    [_observedResolutionItem removeObserver:self forKeyPath:@"mediaPixelSize"
+                                   context:kApolloGalleryViewerResolutionContext];
+    [_observedResolutionPlayerItem removeObserver:self forKeyPath:@"presentationSize"
+                                          context:kApolloGalleryViewerPresentationContext];
     [_slideshowTimer invalidate];
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     // The periodic transport observer must come off the exact player that
@@ -907,6 +935,9 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
     self.postDateLabel.textColor = UIColor.whiteColor;
     self.postDateLabel.font = [UIFont monospacedDigitSystemFontOfSize:13.0 weight:UIFontWeightSemibold];
     self.postDateLabel.textAlignment = NSTextAlignmentCenter;
+    self.postDateLabel.numberOfLines = 2;
+    self.postDateLabel.adjustsFontSizeToFitWidth = YES;
+    self.postDateLabel.minimumScaleFactor = 0.8;
     self.postDatePill = ApolloGalleryChromePill(self.postDateLabel, 0.65);
     self.postDatePill.userInteractionEnabled = NO;
     self.postDatePill.hidden = YES;
@@ -1205,7 +1236,9 @@ static UIInterfaceOrientation ApolloGalleryInterfaceOrientationForDevice(UIDevic
     self.slideshowHost.frame = CGRectMake(side, top + controlHeight + controlGap, iconSize, controlHeight);
     self.slideshowSpeedHost.frame = CGRectMake(side + iconSize + controlGap, top + controlHeight + controlGap, 64.0, controlHeight);
     CGFloat dateY = CGRectGetMaxY(self.counterPill.frame) + controlGap;
-    self.postDatePill.frame = CGRectMake(bounds.size.width - rightSide - 104.0, dateY, 104.0, 28.0);
+    BOOL hasDateAndResolution = [self.postDateLabel.text containsString:@"\n"];
+    CGFloat metadataHeight = hasDateAndResolution ? 48.0 : 28.0;
+    self.postDatePill.frame = CGRectMake(bounds.size.width - rightSide - 148.0, dateY, 148.0, metadataHeight);
     CGFloat statusY = self.postDatePill.hidden ? dateY : CGRectGetMaxY(self.postDatePill.frame) + controlGap;
     self.statusPill.frame = CGRectMake(bounds.size.width - rightSide - 156.0, statusY, 156.0, 28.0);
 
@@ -1274,7 +1307,9 @@ static UIInterfaceOrientation ApolloGalleryInterfaceOrientationForDevice(UIDevic
         CGSize offerSize = [self.rotateOfferHost sizeThatFits:CGSizeMake(bounds.size.width - 2.0 * side, 44.0)];
         CGFloat offerWidth = MIN(MAX(offerSize.width, 180.0), bounds.size.width - 2.0 * side);
         self.rotateOfferHost.frame = CGRectMake((bounds.size.width - offerWidth) / 2.0,
-                                                top + controlHeight + 12.0, offerWidth, 40.0);
+                                                MAX(top + controlHeight + 12.0,
+                                                    (!self.postDatePill.hidden ? CGRectGetMaxY(self.postDatePill.frame) + 8.0 : 0.0)),
+                                                offerWidth, 40.0);
     }
 
     // Above whichever bottom pill is highest, so the toast never lands on the
@@ -1322,7 +1357,13 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
         [self.observedPlayer removeTimeObserver:self.videoTimeObserverToken];
     }
     self.videoTimeObserverToken = nil;
+    [self.observedResolutionPlayerItem removeObserver:self forKeyPath:@"presentationSize"
+                                               context:kApolloGalleryViewerPresentationContext];
     self.observedPlayer = player;
+    self.observedResolutionPlayerItem = player.currentItem;
+    [self.observedResolutionPlayerItem addObserver:self forKeyPath:@"presentationSize"
+                                          options:NSKeyValueObservingOptionInitial
+                                          context:kApolloGalleryViewerPresentationContext];
     self.videoScrubbing = NO;
     if (!player) {
         [self apollo_refreshVideoBarNow];
@@ -1342,6 +1383,13 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
 
 - (void)apollo_refreshVideoBarNow {
     AVPlayer *player = self.observedPlayer;
+    ApolloGalleryItem *resolutionItem = [self apollo_currentItem];
+    // During a page transition the bar may still refer to the previous player.
+    if (resolutionItem.playsAsVideo && player == [self apollo_currentCell].player &&
+        !ApolloGalleryResolutionIsValid(resolutionItem.mediaPixelSize)) {
+        CGSize size = player.currentItem.presentationSize;
+        if (ApolloGalleryResolutionIsValid(size)) resolutionItem.mediaPixelSize = size;
+    }
     ApolloGalleryItem *item = [self apollo_currentItem];
     BOOL showsBar = item.playsAsVideo;
     self.videoBarPill.hidden = !showsBar;
@@ -1482,6 +1530,60 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
     }
 }
 
+// Observe only the active post. Offscreen completions may update their
+// model, but must never replace the label belonging to the current slide.
+- (void)apollo_observeResolutionForItem:(ApolloGalleryItem *)item {
+    if (self.observedResolutionItem == item) return;
+    [self.observedResolutionItem removeObserver:self forKeyPath:@"mediaPixelSize"
+                                       context:kApolloGalleryViewerResolutionContext];
+    self.observedResolutionItem = item;
+    [item addObserver:self forKeyPath:@"mediaPixelSize" options:0
+              context:kApolloGalleryViewerResolutionContext];
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
+                      change:(NSDictionary<NSKeyValueChangeKey, id> *)change context:(void *)context {
+    if (context == kApolloGalleryViewerPresentationContext) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (strongSelf.observedResolutionPlayerItem == object) [strongSelf apollo_refreshVideoBarNow];
+        });
+        return;
+    }
+    if (context != kApolloGalleryViewerResolutionContext) {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf.observedResolutionItem == object && [strongSelf apollo_currentItem] == object) {
+            [strongSelf apollo_updatePostMetadata];
+        }
+    });
+}
+
+- (void)apollo_updatePostMetadata {
+    ApolloGalleryItem *item = [self apollo_currentItem];
+    NSString *date = ApolloGalleryPostDateText(item.postDate);
+    NSString *resolution = ApolloGalleryResolutionText(item.mediaPixelSize);
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    NSMutableArray<NSString *> *spoken = [NSMutableArray array];
+    if (date.length) {
+        [lines addObject:date];
+        [spoken addObject:[@"Post date: " stringByAppendingString:date]];
+    }
+    if (resolution.length) {
+        [lines addObject:resolution];
+        [spoken addObject:[@"Resolution: " stringByAppendingString:resolution]];
+    }
+    self.postDateLabel.text = [lines componentsJoinedByString:@"\n"];
+    self.postDateLabel.accessibilityLabel = [spoken componentsJoinedByString:@", "];
+    self.postDatePill.hidden = (lines.count == 0);
+    [self.view setNeedsLayout];
+}
+
 - (void)apollo_updateChromeContent {
     NSArray<ApolloGalleryItem *> *items = self.feed.items;
     NSInteger total = (NSInteger)items.count;
@@ -1498,10 +1600,8 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
 
     ApolloGalleryItem *item = (index >= 0 && index < total) ? items[index] : nil;
     self.titleLabel.text = item.postTitle ?: @"";
-    NSString *postDate = ApolloGalleryPostDateText(item.postDate);
-    self.postDateLabel.text = postDate;
-    self.postDateLabel.accessibilityLabel = postDate ? [@"Post date: " stringByAppendingString:postDate] : nil;
-    self.postDatePill.hidden = (postDate.length == 0);
+    [self apollo_observeResolutionForItem:item];
+    [self apollo_updatePostMetadata];
     [self apollo_updateMuteButton];
 
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
