@@ -234,8 +234,7 @@ static void ApolloGalleryMenuResolveInheritedSort(UIViewController *owner,
     if (outWindow) *outWindow = window;
 }
 
-static void ApolloGalleryMenuOpenForController(id actionController) {
-    UIViewController *owner = ApolloGalleryMenuOwnerForController(actionController);
+static void ApolloGalleryMenuOpenForOwner(UIViewController *owner, id actionController) {
     // Show the prepared listing on the tap, alongside the menu dismissal.
     // Its presenter retains UIKit's dismissal resources through the push.
     NSString *subreddit = ApolloGalleryMenuIdentifierForOwner(owner);
@@ -251,13 +250,22 @@ static void ApolloGalleryMenuOpenForController(id actionController) {
     NSNumber *inheritedWindow = nil;
     ApolloGalleryMenuResolveInheritedSort(owner, &inheritedSort, &inheritedWindow);
 
+    if (!actionController) {
+        // A direct button has no menu-opening warm-up. Prepare the current
+        // listing now, using the same snapshot and sort as the menu route.
+        [ApolloGalleryViewController prepareGalleryForSubreddit:subreddit
+                                            fromViewController:owner
+                                            inheritedSortValue:inheritedSort
+                                       inheritedTopWindowValue:inheritedWindow];
+    }
+
     dispatch_block_t openGallery = ^{
         [ApolloGalleryViewController presentGalleryForSubreddit:subreddit
                                              fromViewController:owner
                                              inheritedSortValue:inheritedSort
                                         inheritedTopWindowValue:inheritedWindow];
     };
-    if (ApolloNativeActionMenuPerformWithDismissal(actionController, openGallery)) {
+    if (actionController && ApolloNativeActionMenuPerformWithDismissal(actionController, openGallery)) {
         ApolloLog(@"[GalleryMenu] Opening alongside the glass menu dismissal for %@",
                   ApolloGalleryMenuSourceDescription(subreddit));
         return;
@@ -265,9 +273,105 @@ static void ApolloGalleryMenuOpenForController(id actionController) {
     openGallery();
 }
 
+static void ApolloGalleryMenuOpenForController(id actionController) {
+    ApolloGalleryMenuOpenForOwner(ApolloGalleryMenuOwnerForController(actionController), actionController);
+}
+
+#pragma mark - Direct navigation shortcut
+
+static NSString *const kApolloGalleryNavigationButtonIdentifier = @"ApolloReborn.gallery.shortcut";
+static char kApolloGalleryNavigationOwnerKey;
+static char kApolloGalleryNavigationButtonKey;
+
+// UINavigationItem retains the holder; the holder and action both keep the
+// controller weakly. Navigation transitions must not retain old feed pages.
+static UIViewController *ApolloGalleryNavigationOwner(UINavigationItem *item) {
+    NSHashTable *holder = objc_getAssociatedObject(item, &kApolloGalleryNavigationOwnerKey);
+    return holder.anyObject;
+}
+
+static BOOL ApolloGalleryNavigationIsShortcut(UIBarButtonItem *item) {
+    return [item.accessibilityIdentifier isEqualToString:kApolloGalleryNavigationButtonIdentifier];
+}
+
+static NSArray<UIBarButtonItem *> *ApolloGalleryNavigationItems(UINavigationItem *item,
+                                                               NSArray<UIBarButtonItem *> *items) {
+    UIViewController *owner = ApolloGalleryNavigationOwner(item);
+    if (!owner) return items;
+    // Gate on the real feed model, not the nav title: profiles, Home, search
+    // results and the gallery itself must not acquire a misleading shortcut.
+    BOOL eligible = !ApolloReadBoolIvar(owner, "isSearching", NO) &&
+        (ApolloSubredditNameFromViewController(owner).length > 0 ||
+         ApolloMultiredditPathFromViewController(owner).length > 0);
+    for (UIBarButtonItem *candidate in items) {
+        if (candidate.action == @selector(cancelBarButtonItemTappedWithSender:)) eligible = NO;
+    }
+    UIBarButtonItem *button = objc_getAssociatedObject(item, &kApolloGalleryNavigationButtonKey);
+    if (eligible && !button) {
+        __weak UIViewController *weakOwner = owner;
+        UIAction *action = [UIAction actionWithTitle:kApolloGalleryMenuTitle
+                                              image:[UIImage systemImageNamed:kApolloGalleryMenuSymbol]
+                                         identifier:nil handler:^(__unused UIAction *sender) {
+            UIViewController *source = weakOwner;
+            if (!source || source.navigationController.topViewController != source) return;
+            // Resolve again at tap time: Apollo may reuse the Posts controller
+            // for a different subreddit or multireddit.
+            if (ApolloSubredditNameFromViewController(source).length == 0 &&
+                ApolloMultiredditPathFromViewController(source).length == 0) return;
+            ApolloGalleryMenuOpenForOwner(source, nil);
+        }];
+        button = [[UIBarButtonItem alloc] initWithPrimaryAction:action];
+        button.accessibilityIdentifier = kApolloGalleryNavigationButtonIdentifier;
+        button.accessibilityLabel = kApolloGalleryMenuTitle;
+        button.accessibilityHint = @"Open the gallery for this feed";
+        objc_setAssociatedObject(item, &kApolloGalleryNavigationButtonKey, button,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    // A stable item identity and no-op fast path make nested UIKit setters,
+    // sort changes and returning from the gallery idempotent.
+    NSUInteger count = 0;
+    for (UIBarButtonItem *candidate in items) if (ApolloGalleryNavigationIsShortcut(candidate)) count++;
+    if ((!eligible && count == 0) ||
+        (eligible && count == 1 && items.firstObject == button)) return items;
+    NSMutableArray<UIBarButtonItem *> *result = [NSMutableArray array];
+    if (eligible) [result addObject:button];
+    for (UIBarButtonItem *candidate in items) {
+        if (!ApolloGalleryNavigationIsShortcut(candidate)) [result addObject:candidate];
+    }
+    return result;
+}
+
+static void ApolloGalleryNavigationRefresh(UIViewController *owner) {
+    UINavigationItem *item = owner.navigationItem;
+    NSArray *items = item.rightBarButtonItems;
+    NSArray *updated = ApolloGalleryNavigationItems(item, items);
+    if (updated != items) [item setRightBarButtonItems:updated animated:NO];
+}
+
 #pragma mark - Arming
 
 %hook _TtC6Apollo19PostsViewController
+
+- (UINavigationItem *)navigationItem {
+    UINavigationItem *item = %orig;
+    if (item && ApolloGalleryNavigationOwner(item) != (UIViewController *)self) {
+        NSHashTable *holder = [NSHashTable weakObjectsHashTable];
+        [holder addObject:self];
+        objc_setAssociatedObject(item, &kApolloGalleryNavigationOwnerKey, holder,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return item;
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig(animated);
+    ApolloGalleryNavigationRefresh((UIViewController *)self);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig(animated);
+    ApolloGalleryNavigationRefresh((UIViewController *)self);
+}
 
 - (void)moreOptionsBarButtonItemTappedWithSender:(id)sender {
     // Only arm for feeds a gallery makes sense for; that keeps every other
@@ -289,6 +393,33 @@ static void ApolloGalleryMenuOpenForController(id actionController) {
     %orig;
 }
 
+%end
+
+// Feed-owned items only. Apollo rewrites these arrays when sort, search or
+// moderation controls change, so lifecycle-only insertion would disappear.
+%hook UINavigationItem
+- (void)setRightBarButtonItems:(NSArray<UIBarButtonItem *> *)items {
+    %orig(ApolloGalleryNavigationItems(self, items));
+}
+- (void)setRightBarButtonItems:(NSArray<UIBarButtonItem *> *)items animated:(BOOL)animated {
+    %orig(ApolloGalleryNavigationItems(self, items), animated);
+}
+- (void)setRightBarButtonItem:(UIBarButtonItem *)item {
+    NSArray *items = ApolloGalleryNavigationItems(self, item ? @[item] : nil);
+    if (items.count > 1 || (items.count == 1 && items.firstObject != item)) {
+        [self setRightBarButtonItems:items];
+    } else {
+        %orig(items.firstObject);
+    }
+}
+- (void)setRightBarButtonItem:(UIBarButtonItem *)item animated:(BOOL)animated {
+    NSArray *items = ApolloGalleryNavigationItems(self, item ? @[item] : nil);
+    if (items.count > 1 || (items.count == 1 && items.firstObject != item)) {
+        [self setRightBarButtonItems:items animated:animated];
+    } else {
+        %orig(items.firstObject, animated);
+    }
+}
 %end
 
 // Someone else's profile: Apollo's own "..." presents the Private Message /

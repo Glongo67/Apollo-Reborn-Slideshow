@@ -682,7 +682,10 @@ static BOOL ApolloActionsArraysIdentical(NSArray *a, NSArray *b) {
 }
 
 static BOOL ApolloActionsIsDuoFeedControl(UINavigationItem *item, UIBarButtonItem *candidate) {
-    if ([candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoFeedControl"] ||
+    // The Gallery shortcut is an independent, always-visible feed control.
+    // Exclude it from the expandable More group on phones and the Duo rail.
+    if ([candidate.accessibilityIdentifier isEqualToString:@"ApolloReborn.gallery.shortcut"] ||
+        [candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoFeedControl"] ||
         [candidate.accessibilityIdentifier isEqualToString:@"ApolloDuoCommentsLayoutControl"]) return YES;
     if (@available(iOS 27.0, *)) return candidate == item.searchBarPlacementBarButtonItem;
     return NO;
