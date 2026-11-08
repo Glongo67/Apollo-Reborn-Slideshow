@@ -28,6 +28,7 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import "ApolloGalleryResolution.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -192,6 +193,10 @@ static inline BOOL ApolloGallerySortUsesWindow(ApolloGallerySort sort) {
 // gallery visit): every gallery opens with all kinds on, and a filter chosen in
 // one subreddit never follows you into another.
 @property (nonatomic) ApolloGalleryMediaKind allowedKinds;
+// Combined with allowedKinds. Defaults to All for each gallery visit.
+// Unknown dimensions are included only by All. Reselecting HD/SD refreshes
+// classifications that have become known since the previous selection.
+@property (nonatomic) ApolloGalleryQualityFilter allowedQuality;
 // How many of everything fetched so far are of `kind`, for the filter menu's
 // subtitles.
 - (NSUInteger)countOfKind:(ApolloGalleryMediaKind)kind;

@@ -1838,7 +1838,8 @@ static BOOL ApolloGalleryTileAutoplayEnabledForKind(ApolloGalleryMediaKind kind)
 // A filled glyph while a filter is narrowing things down, so it's obvious at a
 // glance that the grid isn't showing everything.
 - (UIImage *)apollo_filterButtonImage {
-    BOOL filtering = self.feed.allowedKinds != ApolloGalleryMediaKindAll;
+    BOOL filtering = self.feed.allowedKinds != ApolloGalleryMediaKindAll ||
+        self.feed.allowedQuality != ApolloGalleryQualityFilterAll;
     return [UIImage systemImageNamed:(filtering ? @"line.3.horizontal.decrease.circle.fill"
                                                 : @"line.3.horizontal.decrease.circle")];
 }
@@ -1879,7 +1880,29 @@ static BOOL ApolloGalleryTileAutoplayEnabledForKind(ApolloGalleryMediaKind kind)
         }
         [children addObject:action];
     }
-    return [UIMenu menuWithTitle:@"Show" children:children];
+    UIMenu *media = [UIMenu menuWithTitle:@"Media" image:nil identifier:nil
+                                 options:UIMenuOptionsDisplayInline children:children];
+    NSMutableArray<UIMenuElement *> *qualities = [NSMutableArray array];
+    NSArray<NSString *> *titles = @[@"Alle Auflösungen", @"Nur HD", @"Nur SD"];
+    NSArray<NSString *> *details = @[@"Auch Medien mit unbekannter Auflösung",
+                                     @"Kürzere Bildseite ab 720 Pixel",
+                                     @"Kürzere Bildseite unter 720 Pixel"];
+    for (NSInteger value = ApolloGalleryQualityFilterAll; value <= ApolloGalleryQualityFilterSD; value++) {
+        ApolloGalleryQualityFilter quality = (ApolloGalleryQualityFilter)value;
+        UIAction *action = [UIAction actionWithTitle:titles[value] image:nil identifier:nil
+                                             handler:^(__kindof UIAction *selected) {
+            (void)selected;
+            [weakSelf apollo_selectQuality:quality];
+        }];
+        action.state = self.feed.allowedQuality == quality ? UIMenuElementStateOn : UIMenuElementStateOff;
+        if ([action respondsToSelector:@selector(setSubtitle:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(action, @selector(setSubtitle:), details[value]);
+        }
+        [qualities addObject:action];
+    }
+    UIMenu *resolution = [UIMenu menuWithTitle:@"Auflösung" image:nil identifier:nil
+                                      options:UIMenuOptionsDisplayInline children:qualities];
+    return [UIMenu menuWithTitle:@"Show" children:@[media, resolution]];
 }
 
 
@@ -1899,6 +1922,18 @@ static BOOL ApolloGalleryTileAutoplayEnabledForKind(ApolloGalleryMediaKind kind)
     [self apollo_cancelAllPrefetches];
 
     self.feed.allowedKinds = updated;
+    [self apollo_finishFilterChange];
+}
+
+- (void)apollo_selectQuality:(ApolloGalleryQualityFilter)quality {
+    if (quality == ApolloGalleryQualityFilterAll && self.feed.allowedQuality == quality) return;
+    [self apollo_cancelAllPrefetches];
+    self.feed.allowedQuality = quality;
+    [self apollo_finishFilterChange];
+}
+
+- (void)apollo_finishFilterChange {
+    ApolloGalleryMediaKind updated = self.feed.allowedKinds;
     self.filterBarButtonItem.image = [self apollo_filterButtonImage];
     self.filterBarButtonItem.menu = [self apollo_buildFilterMenu];
     [self apollo_setFooterText:nil];
@@ -2131,6 +2166,15 @@ static BOOL ApolloGalleryTileAutoplayEnabledForKind(ApolloGalleryMediaKind kind)
             : [NSString stringWithFormat:@"No media found in %@.", self.sourceDescription];
         self.retryButton.hidden = YES;
     }
+    [self.retryButton setTitle:@"Retry" forState:UIControlStateNormal];
+    if (errorMessage.length == 0 && self.feed.allowedQuality != ApolloGalleryQualityFilterAll &&
+        !self.feed.isExhausted && !self.initialLoadPending) {
+        NSString *quality = self.feed.allowedQuality == ApolloGalleryQualityFilterHD ? @"HD" : @"SD";
+        self.messageLabel.text = [NSString stringWithFormat:
+            @"Noch keine %@-Treffer in den geladenen Beiträgen.\nWeitere Beiträge laden oder den Filter erweitern.", quality];
+        [self.retryButton setTitle:@"Weitere laden" forState:UIControlStateNormal];
+        self.retryButton.hidden = NO;
+    }
     self.messageLabel.hidden = NO;
     self.retryButton.tintColor = [self apollo_accentColor];
     [self.view setNeedsLayout];
@@ -2198,7 +2242,7 @@ static BOOL ApolloGalleryTileAutoplayEnabledForKind(ApolloGalleryMediaKind kind)
 // land between a batch starting and finishing, and inserting a stale range is
 // exactly the corruption that NSInternalInconsistencyExceptions are made of.
 // The count can only have GROWN here — shrinks happen solely in
-// apollo_toggleKind, which reloads wholesale.
+// the kind/quality filter handlers, which reload wholesale.
 - (void)apollo_syncAppendedItems {
     if (self.galleryReloadPendingAfterMenu) return;
     NSInteger known = [self.collectionView numberOfItemsInSection:0];

@@ -264,6 +264,10 @@ static BOOL ApolloGalleryURLLooksLikeImage(NSURL *url) {
 @property (nonatomic, strong) NSMutableArray<ApolloGalleryItem *> *mutableItems;
 // `mutableItems` filtered by allowedKinds, rebuilt whenever either changes.
 @property (nonatomic, strong) NSArray<ApolloGalleryItem *> *filteredItems;
+// Freeze classifications until an explicit filter change. Late resolution
+// results must not remove/reorder slides or invalidate append-only UI ranges.
+@property (nonatomic, strong) NSMapTable<ApolloGalleryItem *, NSNumber *> *qualitySnapshot;
+@property (nonatomic) BOOL filterStoppedForEmptyPages;
 // Media already emitted (stream URL for playables, image URL otherwise), so a
 // post that resurfaces on a later listing page — or a repost of the same file —
 // doesn't duplicate a tile.
@@ -440,6 +444,8 @@ static NSString *ApolloGalleryBearerForClient(id client) {
     // a fresh feed — so "videos only" in one feed can't leak into the next, or
     // into next week.
     _allowedKinds = ApolloGalleryMediaKindAll;
+    _allowedQuality = ApolloGalleryQualityFilterAll;
+    _qualitySnapshot = [NSMapTable strongToStrongObjectsMapTable];
     _filteredItems = @[];
 }
 
@@ -467,18 +473,50 @@ static NSString *ApolloGalleryBearerForClient(id client) {
     // the refetch from duplicating tiles.
     self.generation += 1;
     self.loading = NO;
-
+    [self refreshQualitySnapshot];
     [self rebuildFilteredItems];
 }
 
+- (void)setAllowedQuality:(ApolloGalleryQualityFilter)allowedQuality {
+    if (allowedQuality < ApolloGalleryQualityFilterAll || allowedQuality > ApolloGalleryQualityFilterSD) return;
+    if (_allowedQuality == allowedQuality && allowedQuality == ApolloGalleryQualityFilterAll) return;
+    _allowedQuality = allowedQuality;
+    // Match the kind filter's generation invalidation before list membership
+    // changes. A stale request must not insert a range from the old filter.
+    self.generation += 1;
+    self.loading = NO;
+    [self refreshQualitySnapshot];
+    [self rebuildFilteredItems];
+}
+
+- (void)refreshQualitySnapshot {
+    [self.qualitySnapshot removeAllObjects];
+    for (ApolloGalleryItem *item in self.mutableItems) {
+        [self.qualitySnapshot setObject:@(ApolloGalleryResolutionQualityCode(item.mediaPixelSize)) forKey:item];
+    }
+    self.consecutiveEmptyPages = 0;
+    // A previous media filter may have hit the empty-page guard without
+    // reaching the real source end. Widening/changing a filter can continue.
+    if (self.filterStoppedForEmptyPages) {
+        self.filterStoppedForEmptyPages = NO;
+        self.exhausted = NO;
+    }
+}
+
 - (void)rebuildFilteredItems {
-    if (self.allowedKinds == ApolloGalleryMediaKindAll) {
+    if (self.allowedKinds == ApolloGalleryMediaKindAll && self.allowedQuality == ApolloGalleryQualityFilterAll) {
         self.filteredItems = [self.mutableItems copy];
         return;
     }
     NSMutableArray<ApolloGalleryItem *> *visible = [NSMutableArray array];
     for (ApolloGalleryItem *item in self.mutableItems) {
-        if (item.kind & self.allowedKinds) [visible addObject:item];
+        if (!(item.kind & self.allowedKinds)) continue;
+        NSNumber *quality = [self.qualitySnapshot objectForKey:item];
+        if (!quality) {
+            quality = @(ApolloGalleryResolutionQualityCode(item.mediaPixelSize));
+            [self.qualitySnapshot setObject:quality forKey:item];
+        }
+        if (ApolloGalleryQualityFilterIncludesCode(self.allowedQuality, quality.integerValue)) [visible addObject:item];
     }
     self.filteredItems = visible;
 }
@@ -524,6 +562,8 @@ static NSString *ApolloGalleryBearerForClient(id client) {
 - (void)reset {
     self.generation += 1;
     [self.mutableItems removeAllObjects];
+    [self.qualitySnapshot removeAllObjects];
+    self.filterStoppedForEmptyPages = NO;
     self.filteredItems = @[];
     [self.seenImageKeys removeAllObjects];
     self.afterCursor = nil;
@@ -882,6 +922,7 @@ static NSString *ApolloGalleryBearerForClient(id client) {
             // Saved can contain long runs of text posts/comments. Its finite
             // source must not truncate before later media or category matches.
             BOOL tooManyEmptyPages = !strongSelf.savedFeed &&
+                strongSelf.allowedQuality == ApolloGalleryQualityFilterAll &&
                 (strongSelf.consecutiveEmptyPages >= kApolloGalleryEmptyPageLimit);
             // Publish every useful page immediately, including continuations
             // of a seeded gallery. Small tiles can expose the end of the seed
@@ -891,10 +932,12 @@ static NSString *ApolloGalleryBearerForClient(id client) {
             // Keep walking Saved until matching media or the end, so a long
             // run of comments or other categories cannot strand later photos.
             BOOL outOfPageBudget = (pagesLeft <= 1) &&
-                !(strongSelf.savedFeed && gainedThisBatch == 0);
+                !(strongSelf.savedFeed && gainedThisBatch == 0 &&
+                  strongSelf.allowedQuality == ApolloGalleryQualityFilterAll);
 
             if (noMorePages || tooManyEmptyPages) {
                 strongSelf.exhausted = YES;
+                strongSelf.filterStoppedForEmptyPages = tooManyEmptyPages && !noMorePages;
                 ApolloLog(@"[Gallery] %@ exhausted (cursor=%@ emptyPages=%ld shown=%lu of %lu)",
                           strongSelf.sourceDescription, nextCursor ?: @"nil",
                           (long)strongSelf.consecutiveEmptyPages,
@@ -953,6 +996,7 @@ static NSString *ApolloGalleryBearerForClient(id client) {
     [self rebuildFilteredItems];
     if (self.filteredItems.count == 0 && !self.savedFeed) {
         [self.mutableItems removeAllObjects];
+        [self.qualitySnapshot removeAllObjects];
         [self.seenImageKeys removeAllObjects];
         return NO;
     }

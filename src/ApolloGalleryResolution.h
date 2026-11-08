@@ -25,10 +25,27 @@ NS_INLINE NSString * _Nullable ApolloGalleryResolutionText(CGSize size) {
     if (!ApolloGalleryResolutionIsValid(size)) return nil;
     return [NSString stringWithFormat:@"%.0f × %.0f", (double)size.width, (double)size.height];
 }
+typedef NS_ENUM(NSInteger, ApolloGalleryQualityFilter) {
+    ApolloGalleryQualityFilterAll = 0,
+    ApolloGalleryQualityFilterHD = 1,
+    ApolloGalleryQualityFilterSD = 2,
+};
+
+// -1 is unknown and must never silently enter the SD bucket.
+NS_INLINE NSInteger ApolloGalleryResolutionQualityCode(CGSize size) {
+    if (!ApolloGalleryResolutionIsValid(size)) return -1;
+    return MIN(size.width, size.height) >= 720.0 ? ApolloGalleryQualityFilterHD : ApolloGalleryQualityFilterSD;
+}
+
+NS_INLINE BOOL ApolloGalleryQualityFilterIncludesCode(ApolloGalleryQualityFilter filter, NSInteger quality) {
+    return filter == ApolloGalleryQualityFilterAll || (quality >= 1 && quality == filter);
+}
+
 // Orientation-independent HD threshold: at least 720 pixels on both axes.
 NS_INLINE NSString * _Nullable ApolloGalleryResolutionQualityText(CGSize size) {
-    if (!ApolloGalleryResolutionIsValid(size)) return nil;
-    return MIN(size.width, size.height) >= 720.0 ? @"HD" : @"SD";
+    NSInteger quality = ApolloGalleryResolutionQualityCode(size);
+    if (quality < 0) return nil;
+    return quality == ApolloGalleryQualityFilterHD ? @"HD" : @"SD";
 }
 
 // Read container metadata, without decoding a bitmap. A full-tier image may
